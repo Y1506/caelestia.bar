@@ -1,0 +1,583 @@
+pragma Singleton
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import Quickshell.Hyprland
+import Quickshell.Services.Mpris
+import ".."
+
+// System probes shared by the bar and drawers (network, resources, uptime,
+// weather). Polling only runs while something visible asks for it.
+QtObject {
+  id: root
+
+  function run(cmd) { Quickshell.execDetached(["bash", "-c", cmd]) }
+
+  // ------------------------------------------------------------ time
+  // The one clock-format switch (Settings › Language & region › 12-hour
+  // clock). Every time Omacale shows goes through these.
+  readonly property bool h12: !Config.o.general.clock24
+  readonly property string timeFormat: h12 ? "h:mm AP" : "HH:mm"
+  function time(d) { return d ? Qt.formatTime(d, timeFormat) : "" }
+  // Hour on its own (the stacked bar/dashboard clocks). Qt only gives a
+  // 12-hour "hh" when the same format string has an AP, so format both and
+  // drop the AP.
+  function hour(d) { return d ? (h12 ? Qt.formatTime(d, "hh AP").split(" ")[0] : Qt.formatTime(d, "HH")) : "" }
+  function dateTime(d) { return d ? Qt.formatDateTime(d, "d MMM yyyy, " + timeFormat) : "" }
+  // Quickshell's own Hyprland socket, not a `hyprctl` process: spawning one
+  // takes long enough that a dispatch made as a panel closes can land after
+  // the surface is gone (the overview's click-to-switch did).
+  function hypr(dispatcher) { Hyprland.dispatch(dispatcher) }
+  // A value as a quoted Lua string literal. A dispatcher is Lua source, so a
+  // name pasted in raw could close its string with `"` and run any Lua;
+  // backslash, quote and control characters become decimal escapes (\ddd).
+  function luaStr(s) {
+    return '"' + String(s).replace(/[\\"\x00-\x1f\x7f]/g, c => "\\" + String(c.charCodeAt(0)).padStart(3, "0")) + '"'
+  }
+  function workspace(id) { hypr("hl.dsp.focus({ workspace = " + luaStr(id) + " })") }
+  function toggleSpecial(name) { hypr("hl.dsp.workspace.toggle_special(" + luaStr(name) + ")") }
+  // Window dispatchers, by Hyprland address (the overview drives these).
+  function focusWindow(addr) { hypr("hl.dsp.focus({ window = " + luaStr("address:" + addr) + " })") }
+  function closeWindow(addr) { hypr("hl.dsp.window.close(" + luaStr("address:" + addr) + ")") }
+  function moveWindow(addr, ws) { hypr("hl.dsp.window.move({ workspace = " + luaStr(ws) + ", follow = false, window = " + luaStr("address:" + addr) + " })") }
+
+  // Port of Caelestia's Hypr.activeToplevel (services/Hypr.qml): Hyprland
+  // keeps reporting the last focused window after switching to an empty
+  // workspace, so only trust it while the focused workspace has windows (or
+  // the window sits on a special workspace that is actually open).
+  readonly property var activeToplevel: {
+    const t = Hyprland.activeToplevel
+    if (!t)
+      return null
+    const name = t.workspace ? t.workspace.name : ""
+    // A special workspace's window stays "active" in Hyprland's eyes after
+    // the special is toggled away, so the name test alone let it survive
+    // onto an empty workspace and the bar kept its title instead of
+    // "Desktop". It only counts while that special is the one open on the
+    // focused monitor -- which lives in lastIpcObject, refreshed on
+    // `activespecial` by Workspaces.qml's Connections.
+    if (name.startsWith("special:")) {
+      const sw = Hyprland.focusedMonitor?.lastIpcObject?.specialWorkspace
+      return (sw && sw.name) === name ? t : null
+    }
+    const ws = Hyprland.focusedWorkspace
+    return ws?.toplevels.values.length > 0 ? t : null
+  }
+
+  // ------------------------------------------------------------ network
+  // What the bar icon and the network popout show. NetService already holds
+  // all of it over NetworkManager (Quickshell.Networking), event-driven, so
+  // this is a view onto that rather than a probe of its own: the `nmcli`
+  // pair this used to run every 5s cost ~28ms of CPU a go -- half a percent
+  // of a core for the whole session, whether or not anything was looking.
+  readonly property bool ethernet: !!(NetService.wiredDevice && NetService.wiredDevice.connected)
+  readonly property bool wifi: !!(NetService.wifiDevice && NetService.wifiDevice.connected)
+  readonly property string ssid: NetService.connectedNetwork ? NetService.connectedNetwork.name : ""
+  readonly property int strength: NetService.connectedNetwork ? NetService.strength(NetService.connectedNetwork) : 0
+  // [{ssid, strength, secure, active}], strongest first with the active one
+  // on top, deduplicated by SSID as the old `nmcli` list was.
+  readonly property var networks: {
+    const out = []
+    for (const n of NetService.networks) {
+      if (!n || !n.name || out.some(x => x.ssid === n.name))
+        continue
+      out.push({ ssid: n.name, strength: NetService.strength(n), secure: !NetService.isOpen(n.security), active: !!n.connected })
+    }
+    return out.sort((x, y) => (y.active - x.active) || (y.strength - x.strength))
+  }
+
+  // ---------------------------------------------------------- resources
+  property int resourcesWanted: 0
+  property real cpu: 0
+  property real mem: 0
+  property real memUsedGb: 0
+  property real memTotalGb: 0
+  property real disk: 0
+  property string diskText: ""
+  property real cpuTemp: 0
+  property var _lastCpu: null
+
+  property FileView statFile: FileView { path: "/proc/stat"; printErrors: false }
+  property FileView memFile: FileView { path: "/proc/meminfo"; printErrors: false }
+  // Mounted disks (deduplicated by device) and the one shown on the dashboard.
+  property var disks: []            // [{ mount, used, total }]
+  property string primaryMount: "/"
+  readonly property var primaryDisk: disks.find(d => d.mount === primaryMount) || disks[0] || null
+  // Disk usage. Ran on every resource tick beside the CPU temperature; split
+  // off and slowed right down, because a filesystem does not fill up at 1Hz
+  // and `df` is a process (plus the shell around it) each time.
+  property Process diskProbe: Process {
+    command: ["bash", "-c",
+      "df -B1 --output=source,target,used,size -x tmpfs -x devtmpfs -x efivarfs -x overlay -x squashfs 2>/dev/null | tail -n +2 | sort -u -k1,1"]
+    property var acc: []
+    onStarted: acc = []
+    stdout: SplitParser {
+      onRead: function(l) {
+        const p = l.trim().split(/\s+/)
+        if (p.length >= 4) root.diskProbe.acc.push({ mount: p[1], used: Number(p[2]), total: Number(p[3]) })
+      }
+    }
+    onExited: {
+      const d = acc.sort((a, b) => a.mount.length - b.mount.length)
+      root.disks = d
+      const pd = root.primaryDisk
+      root.disk = pd && pd.total ? pd.used / pd.total : 0
+      root.diskText = pd ? root.fmtBytes(pd.used) + " / " + root.fmtBytes(pd.total) : ""
+    }
+  }
+  property Timer diskTimer: Timer {
+    interval: 10000; repeat: true; triggeredOnStart: true
+    running: root.resourcesWanted > 0
+    onTriggered: if (!root.diskProbe.running) root.diskProbe.running = true
+  }
+
+  // CPU package temperature. The hwmon scan that found it used to run on
+  // every tick, spawning a `cat` per sensor label to re-answer a question
+  // whose answer is a fixed path; resolve that path once, then read the file
+  // in process for the rest of the session.
+  property string cpuTempPath: ""
+  property Process tempScan: Process {
+    running: true
+    command: ["bash", "-c",
+      "for h in /sys/class/hwmon/hwmon*; do case $(cat $h/name 2>/dev/null) in coretemp|k10temp|zenpower) " +
+      "for l in $h/temp*_label; do case $(cat $l 2>/dev/null) in 'Package id'*|Tdie|Tctl) echo ${l%_label}_input; break 2;; esac; done;; esac; done"]
+    stdout: StdioCollector {
+      onStreamFinished: root.cpuTempPath = String(text).trim().split("\n")[0] || ""
+    }
+  }
+  property FileView cpuTempFile: FileView {
+    path: root.cpuTempPath
+    printErrors: false
+    onLoaded: root.cpuTemp = (parseInt(String(text()).trim()) || 0) / 1000
+    onLoadFailed: root.cpuTemp = 0
+  }
+
+  // CPU model
+  property string cpuName: ""
+  property FileView cpuInfo: FileView {
+    path: "/proc/cpuinfo"
+    printErrors: false
+    onLoaded: {
+      const m = String(text()).match(/model name\s*:\s*(.+)/)
+      root.cpuName = m ? m[1].replace(/\(R\)|\(TM\)|CPU|@.*$/g, "").replace(/\s+/g, " ").trim() : ""
+    }
+  }
+
+  // GPU (helper never wakes a suspended NVIDIA dGPU)
+  property string gpuType: "none"
+  property string gpuName: ""
+  property real gpu: 0
+  property real gpuTemp: 0
+  property bool gpuSleeping: false
+  // Set once the helper has reported "none": there is no adapter to watch,
+  // so nothing is gained by asking again for the rest of the session.
+  property bool gpuAbsent: false
+  property Process gpuProbe: Process {
+    // The name is handed back in, with the type it was resolved for, so the
+    // helper can skip the lspci and the second nvidia-smi that resolving it
+    // costs (see scripts/gpu.sh).
+    command: ["bash", Qt.resolvedUrl("../scripts/gpu.sh").toString().replace("file://", ""), root.gpuName, root.gpuType]
+    stdout: SplitParser {
+      onRead: function(l) {
+        const p = l.split("|")
+        root.gpuType = p[0]; root.gpuName = p[1] || ""
+        root.gpu = (parseFloat(p[2]) || 0) / 100; root.gpuTemp = parseFloat(p[3]) || 0
+        root.gpuSleeping = p[4] === "1"
+        root.gpuAbsent = p[0] === "none"
+      }
+    }
+  }
+  // On its own beat, and a slower one: an NVIDIA reading means an nvidia-smi
+  // (~20ms, and the only way to get utilisation out of the proprietary
+  // driver), which is far too much to pay at the CPU and memory rate for a
+  // gauge nobody reads that closely.
+  property Timer gpuTimer: Timer {
+    interval: Math.max(2000, Config.o.services.resourceUpdateInterval)
+    repeat: true; triggeredOnStart: true
+    running: root.resourcesWanted > 0 && !root.gpuAbsent
+    onTriggered: if (!root.gpuProbe.running) root.gpuProbe.running = true
+  }
+
+  // Network throughput (bytes/s) with a rolling history for the sparkline.
+  readonly property int netHistory: 30
+  property var downHistory: []
+  property var upHistory: []
+  property real downSpeed: 0
+  property real upSpeed: 0
+  property real downTotal: 0
+  property real upTotal: 0
+  property var _lastNet: null
+  property FileView netDev: FileView { path: "/proc/net/dev"; printErrors: false }
+  function sampleNet() {
+    netDev.reload()
+    let rx = 0, tx = 0
+    String(netDev.text()).split("\n").slice(2).forEach(l => {
+      const m = l.trim().match(/^([^:]+):\s*(.*)$/)
+      if (!m || m[1] === "lo" || /^(docker|veth|br-|virbr|tun|wg)/.test(m[1])) return
+      const f = m[2].split(/\s+/).map(Number)
+      rx += f[0]; tx += f[8]
+    })
+    const now = Date.now()
+    if (_lastNet) {
+      const dt = Math.max(0.2, (now - _lastNet.t) / 1000)
+      downSpeed = Math.max(0, (rx - _lastNet.rx) / dt)
+      upSpeed = Math.max(0, (tx - _lastNet.tx) / dt)
+      downTotal += Math.max(0, rx - _lastNet.rx)
+      upTotal += Math.max(0, tx - _lastNet.tx)
+      downHistory = downHistory.concat([downSpeed]).slice(-netHistory)
+      upHistory = upHistory.concat([upSpeed]).slice(-netHistory)
+    }
+    _lastNet = { rx: rx, tx: tx, t: now }
+  }
+
+  function fmtBytes(b, perSecond) {
+    const u = ["B", "KiB", "MiB", "GiB", "TiB"]
+    let i = 0
+    b = Math.max(0, b || 0)
+    while (b >= 1024 && i < u.length - 1) { b /= 1024; i++ }
+    return (i === 0 ? Math.round(b) : b.toFixed(b < 10 ? 1 : 0)) + " " + u[i] + (perSecond ? "/s" : "")
+  }
+  // Caelestia Units.formatKibUsage: both halves scaled to the total's unit,
+  // one decimal with a trailing .0 dropped ("3.4 / 16 GiB").
+  function fmtUsage(used, total) {
+    const u = ["B", "KiB", "MiB", "GiB", "TiB"]
+    let i = 0
+    let t = Math.max(0, total || 0)
+    let d = 1
+    while (t >= 1024 && i < u.length - 1) { t /= 1024; d *= 1024; i++ }
+    return (+(Math.max(0, used || 0) / d).toFixed(1)) + " / " + (+t.toFixed(1)) + " " + u[i]
+  }
+
+  property Timer resTimer: Timer {
+    interval: Config.o.services.resourceUpdateInterval; repeat: true; triggeredOnStart: true
+    running: root.resourcesWanted > 0
+    // A stale baseline would turn the whole time the dashboard was closed
+    // into one giant first sample.
+    onRunningChanged: if (!running) root._lastNet = null
+    onTriggered: {
+      root.statFile.reload()
+      const m = String(root.statFile.text()).split("\n")[0].trim().split(/\s+/).slice(1).map(Number)
+      const idle = m[3] + (m[4] || 0)
+      const total = m.reduce((a, b) => a + b, 0)
+      if (root._lastCpu) {
+        const dt = total - root._lastCpu.total, di = idle - root._lastCpu.idle
+        root.cpu = dt > 0 ? Math.max(0, Math.min(1, 1 - di / dt)) : 0
+      }
+      root._lastCpu = { total: total, idle: idle }
+      root.memFile.reload()
+      const t = String(root.memFile.text())
+      const tot = parseInt((t.match(/MemTotal:\s+(\d+)/) || [])[1]) || 1
+      const av = parseInt((t.match(/MemAvailable:\s+(\d+)/) || [])[1]) || 0
+      root.mem = 1 - av / tot
+      root.memUsedGb = (tot - av) / 1048576
+      root.memTotalGb = tot / 1048576
+      root.sampleNet()
+      // Disk and GPU have their own, slower timers; everything left on this
+      // one is a /proc read done in process, so the tick spawns nothing.
+      if (root.cpuTempPath) root.cpuTempFile.reload()
+    }
+  }
+
+  // ------------------------------------------------------------- uptime
+  property string uptime: ""
+  property FileView uptimeFile: FileView { path: "/proc/uptime"; printErrors: false }
+  property Timer uptimeTimer: Timer {
+    interval: 60000; running: true; repeat: true; triggeredOnStart: true
+    onTriggered: {
+      root.uptimeFile.reload()
+      const s = parseFloat(String(root.uptimeFile.text()).split(" ")[0]) || 0
+      const d = Math.floor(s / 86400), h = Math.floor(s / 3600) % 24, m = Math.floor(s / 60) % 60
+      const parts = []
+      if (d) parts.push(d + (d === 1 ? " day" : " days"))
+      if (h) parts.push(h + (h === 1 ? " hour" : " hours"))
+      if (!d && m) parts.push(m + (m === 1 ? " minute" : " minutes"))
+      root.uptime = parts.join(", ") || "just now"
+    }
+  }
+
+  // ------------------------------------------------------------ weather
+  // Open-Meteo via scripts/weather.sh — Caelestia's source and WMO codes.
+  property string weatherIcon: "cloud"
+  property string temp: "--°"
+  property string weatherDesc: "Weather"
+  property string city: ""
+  property string feelsLike: "--°"
+  property int humidity: 0
+  property real windSpeed: 0
+  // Kept raw so a clock-format change reformats them without a refetch.
+  property string sunriseIso: ""
+  property string sunsetIso: ""
+  readonly property string sunrise: fmtTime(sunriseIso)
+  readonly property string sunset: fmtTime(sunsetIso)
+  property var forecast: []
+  readonly property string weatherLocation: Config.o.general.weatherLocation
+  readonly property bool imperial: Config.o.general.units === "imperial"
+  readonly property var wmoIcons: ({
+    "0": "clear_day", "1": "clear_day", "2": "partly_cloudy_day", "3": "cloud", "45": "foggy", "48": "foggy",
+    "51": "rainy", "53": "rainy", "55": "rainy", "56": "rainy", "57": "rainy", "61": "rainy", "63": "rainy",
+    "65": "rainy", "66": "rainy", "67": "rainy", "71": "cloudy_snowing", "73": "cloudy_snowing", "75": "snowing_heavy",
+    "77": "cloudy_snowing", "80": "rainy", "81": "rainy", "82": "rainy", "85": "cloudy_snowing", "86": "snowing_heavy",
+    "95": "thunderstorm", "96": "thunderstorm", "99": "thunderstorm"
+  })
+  readonly property var wmoText: ({
+    "0": "Clear", "1": "Clear", "2": "Partly cloudy", "3": "Overcast", "45": "Fog", "48": "Fog",
+    "51": "Drizzle", "53": "Drizzle", "55": "Drizzle", "56": "Freezing drizzle", "57": "Freezing drizzle",
+    "61": "Light rain", "63": "Rain", "65": "Heavy rain", "66": "Light rain", "67": "Heavy rain",
+    "71": "Light snow", "73": "Snow", "75": "Heavy snow", "77": "Snow", "80": "Light rain", "81": "Rain",
+    "82": "Heavy rain", "85": "Light snow showers", "86": "Heavy snow showers", "95": "Thunderstorm",
+    "96": "Thunderstorm with hail", "99": "Thunderstorm with hail"
+  })
+  function weatherIconFor(code, day) {
+    const i = wmoIcons[String(code)] || "air"
+    if (day === 0 && i === "clear_day") return "clear_night"
+    if (day === 0 && i === "partly_cloudy_day") return "partly_cloudy_night"
+    return i
+  }
+  function fmtTemp(t) { return t === undefined || t === null ? "--°" : Math.round(t) + (imperial ? "°F" : "°C") }
+  function fmtTime(iso) { return iso ? time(new Date(iso)) : "--:--" }
+  onWeatherLocationChanged: weatherProbe.running = true
+  onImperialChanged: weatherProbe.running = true
+  property Process weatherProbe: Process {
+    command: ["bash", Qt.resolvedUrl("../scripts/weather.sh").toString().replace("file://", ""), root.weatherLocation, root.imperial ? "imperial" : "metric"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          const j = JSON.parse(text)
+          if (j.error) return
+          const c = j.current
+          root.city = j.city
+          root.temp = root.fmtTemp(c.temperature_2m)
+          root.feelsLike = root.fmtTemp(c.apparent_temperature)
+          root.humidity = c.relative_humidity_2m
+          root.windSpeed = Math.round(c.wind_speed_10m)
+          root.weatherIcon = root.weatherIconFor(c.weather_code, c.is_day)
+          root.weatherDesc = root.wmoText[String(c.weather_code)] || "Unknown"
+          root.forecast = j.daily
+          if (j.daily.length) { root.sunriseIso = j.daily[0].sunrise || ""; root.sunsetIso = j.daily[0].sunset || "" }
+        } catch (e) {}
+      }
+    }
+  }
+  property Timer weatherTimer: Timer {
+    interval: 1800000; running: true; repeat: true; triggeredOnStart: true
+    onTriggered: root.weatherProbe.running = true
+  }
+
+  // ------------------------------------------------------------ sysinfo
+  // What Caelestia's SysInfo feeds its fetch card with (lock/Fetch.qml).
+  readonly property string user: Quickshell.env("USER") || Quickshell.env("LOGNAME") || "user"
+  readonly property string wm: Quickshell.env("XDG_CURRENT_DESKTOP") || "Hyprland"
+  property string osName: "Linux"
+  property FileView osRelease: FileView {
+    path: "/etc/os-release"
+    printErrors: false
+    onLoaded: {
+      const m = /^PRETTY_NAME="?([^"\n]+)"?/m.exec(text())
+      if (m) root.osName = m[1]
+    }
+  }
+
+  // Caps / num lock (Hyprland has no event for these). Polled here rather
+  // than in Bar.qml so the lock screen can show them too.
+  //
+  // The state is read from the kernel's LED class, not from `hyprctl devices
+  // -j`: that serialises every input device to JSON and cost 4.4ms a go,
+  // 1.5s apart, for the whole session, where reading the LED files in
+  // process is free. Hyprland mirrors the lock state onto every keyboard's
+  // LEDs, so any one of them lit means the modifier is on. Machines with no
+  // LED nodes at all (some VMs, Bluetooth-only keyboards) keep hyprctl.
+  property bool capsLock: false
+  property bool numLock: false
+
+  property var capsLeds: []
+  property var numLeds: []
+  readonly property bool ledsFound: capsLeds.length > 0 || numLeds.length > 0
+  // One spawn, at startup: QML has no way to enumerate /sys/class/leds.
+  property Process ledScan: Process {
+    running: true
+    command: ["bash", "-c",
+      "for f in /sys/class/leds/*::capslock/brightness; do [[ -r $f ]] && echo \"c:$f\"; done; " +
+      "for f in /sys/class/leds/*::numlock/brightness; do [[ -r $f ]] && echo \"n:$f\"; done"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        const c = [], n = []
+        for (const line of String(text).split("\n")) {
+          const s = line.trim()
+          if (s.indexOf("c:") === 0) c.push(s.slice(2))
+          else if (s.indexOf("n:") === 0) n.push(s.slice(2))
+        }
+        root.capsLeds = c
+        root.numLeds = n
+      }
+    }
+  }
+  // Mutated in place and read back by syncLeds, so a tick costs no garbage.
+  property var ledState: ({})
+  function syncLeds() {
+    if (!ledsFound)
+      return
+    capsLock = capsLeds.some(p => ledState[p])
+    numLock = numLeds.some(p => ledState[p])
+  }
+  property Instantiator ledReaders: Instantiator {
+    model: root.capsLeds.concat(root.numLeds)
+    delegate: FileView {
+      required property string modelData
+      path: modelData
+      printErrors: false
+      onLoaded: { root.ledState[modelData] = String(text()).trim() !== "0"; root.syncLeds() }
+      onLoadFailed: { root.ledState[modelData] = false; root.syncLeds() }
+    }
+  }
+
+  property Process lockKeysProbe: Process {
+    command: ["hyprctl", "devices", "-j"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          const k = JSON.parse(text).keyboards.find(k => k.main) || {}
+          root.capsLock = !!k.capsLock
+          root.numLock = !!k.numLock
+        } catch (e) {}
+      }
+    }
+  }
+  property Timer lockKeysTimer: Timer {
+    interval: 1500; running: true; repeat: true
+    onTriggered: {
+      if (root.ledsFound) {
+        for (let i = 0; i < root.ledReaders.count; i++)
+          root.ledReaders.objectAt(i)?.reload()
+      } else if (!root.lockKeysProbe.running) {
+        root.lockKeysProbe.running = true
+      }
+    }
+  }
+
+  // ------------------------------------------------------------- players
+  property var manualPlayer: null
+  readonly property var players: Mpris.players.values
+  readonly property var player: {
+    const ps = players
+    if (manualPlayer && ps.indexOf(manualPlayer) >= 0) return manualPlayer
+    return ps.find(p => p.isPlaying) || ps[0] || null
+  }
+  function playerName(p) { return p ? (p.identity || p.desktopEntry || "Player") : "" }
+
+  // -------------------------------------------------------------- lyrics
+  // Synced lyrics from lrclib.net (scripts/lyrics.sh), parsed from LRC.
+  property var lyrics: []             // [{ time, text }]
+  property string lyricsState: "none" // loading | ready | none
+  // The lrclib record the lyrics came from: { title, artist, album }.
+  property var lyricsMatch: null
+  property string _lyricsKey: ""
+  readonly property string lyricsKey: player && Config.o.dashboard.lyrics ? (player.trackArtist + "\u0001" + player.trackTitle) : ""
+  onLyricsKeyChanged: lyricsDebounce.restart()
+  property Timer lyricsDebounce: Timer {
+    interval: 400
+    onTriggered: {
+      if (root.lyricsKey === root._lyricsKey) return
+      root._lyricsKey = root.lyricsKey
+      root.lyrics = []
+      root.lyricsMatch = null
+      if (!root.lyricsKey || !root.player.trackTitle) { root.lyricsState = "none"; return }
+      root.lyricsState = "loading"
+      root.lyricsProbe.running = false
+      root.lyricsProbe.command = ["bash", Qt.resolvedUrl("../scripts/lyrics.sh").toString().replace("file://", ""),
+        root.player.trackArtist || "", root.player.trackTitle || "", root.player.trackAlbum || "",
+        String(Math.round(root.player.length > 0 && root.player.length < 36000 ? root.player.length : 0))]
+      root.lyricsProbe.running = true
+    }
+  }
+  property Process lyricsProbe: Process {
+    stdout: StdioCollector {
+      onStreamFinished: {
+        const out = []
+        let match = null
+        String(text).split("\n").forEach(l => {
+          if (l.startsWith("#match\t")) {
+            const f = l.split("\t")
+            match = { title: f[1] || "", artist: f[2] || "", album: f[3] || "" }
+            return
+          }
+          const m = l.match(/^\[(\d+):(\d+(?:\.\d+)?)\](.*)$/)
+          if (m) out.push({ time: parseInt(m[1]) * 60 + parseFloat(m[2]), text: m[3].trim() })
+        })
+        root.lyricsMatch = out.length ? match : null
+        root.lyrics = out
+        root.lyricsState = out.length ? "ready" : "none"
+      }
+    }
+  }
+  function lyricIndexAt(pos) {
+    let i = -1
+    for (let k = 0; k < lyrics.length; k++) { if (lyrics[k].time <= pos + 0.15) i = k; else break }
+    return i
+  }
+
+  // ---------------------------------------------------------- visualiser
+  // cava via scripts/cava.sh, only while something shows it (the dashboard's
+  // media tab, the desktop visualiser); each user checks its own setting.
+  readonly property int visBars: Math.max(10, Config.o.services.visualiserBars)
+  onVisBarsChanged: if (cava.running) { cava.running = false; cavaRestart.restart() }
+  property Timer cavaRestart: Timer { interval: 50; onTriggered: root.cava.running = Qt.binding(() => root.visualiserWanted > 0 && !root.cavaMissing) }
+  property int visualiserWanted: 0
+  property var visValues: []
+  property string _visLine: ""
+  property bool cavaMissing: false
+  property Process cava: Process {
+    running: root.visualiserWanted > 0 && !root.cavaMissing
+    command: ["bash", Qt.resolvedUrl("../scripts/cava.sh").toString().replace("file://", ""), String(root.visBars)]
+    stdout: SplitParser {
+      onRead: function(l) {
+        // cava prints a frame 60 times a second even in silence.
+        if (l === root._visLine) return
+        root._visLine = l
+        const v = l.split(";")
+        if (v.length >= root.visBars) root.visValues = v.slice(0, root.visBars).map(x => (parseInt(x) || 0) / 1000)
+      }
+    }
+    onExited: (code) => { if (code === 127) root.cavaMissing = true; root.visValues = []; root._visLine = "" }
+  }
+
+  // --------------------------------------------------------------- icons
+  readonly property var categoryIcons: ({
+    WebBrowser: "web", Printing: "print", Security: "security", Network: "chat", Archiving: "archive",
+    Compression: "archive", Development: "code", IDE: "code", TextEditor: "edit_note", Audio: "music_note",
+    Music: "music_note", Player: "music_note", Recorder: "mic", Game: "sports_esports", FileTools: "files",
+    FileManager: "files", Filesystem: "files", FileTransfer: "files", Settings: "settings",
+    DesktopSettings: "settings", HardwareSettings: "settings", TerminalEmulator: "terminal",
+    ConsoleOnly: "terminal", Utility: "build", Monitor: "monitor_heart", Midi: "graphic_eq", Mixer: "graphic_eq",
+    AudioVideoEditing: "video_settings", AudioVideo: "music_video", Video: "videocam", Building: "construction",
+    Graphics: "photo_library", "2DGraphics": "photo_library", RasterGraphics: "photo_library", TV: "tv",
+    System: "host", Office: "content_paste"
+  })
+  function appIcon(cls, fallback) {
+    if (!cls) return fallback
+    const e = DesktopEntries.heuristicLookup(cls)
+    const cats = e ? e.categories : null
+    if (cats) for (const k in categoryIcons) if (cats.indexOf(k) !== -1) return categoryIcons[k]
+    // Omarchy's web apps ("chrome-<host>__-Default") match no entry, and their
+    // entries carry no categories: show them as the browser they run in.
+    if (WindowIcons.webappHost(cls) || WindowIcons.isBrowserClass(cls)) return categoryIcons.WebBrowser
+    return fallback
+  }
+  function networkIcon(s) {
+    return ["signal_wifi_0_bar", "network_wifi_1_bar", "network_wifi_2_bar", "network_wifi_3_bar", "network_wifi"][Math.max(0, Math.min(4, Math.floor(s / 20)))]
+  }
+  function batteryIcon(p, charging) {
+    if (p >= 0.995) return charging ? "battery_charging_full" : "battery_full"
+    let level = Math.floor(p * 7)
+    if (charging && (level === 4 || level === 1)) level--
+    return charging ? "battery_charging_" + ((level + 3) * 10) : "battery_" + level + "_bar"
+  }
+  function bluetoothIcon(icon) {
+    const i = String(icon || "")
+    if (i.indexOf("headset") >= 0 || i.indexOf("headphones") >= 0) return "headphones"
+    if (i.indexOf("audio") >= 0) return "speaker"
+    if (i.indexOf("phone") >= 0) return "smartphone"
+    if (i.indexOf("mouse") >= 0) return "mouse"
+    if (i.indexOf("keyboard") >= 0) return "keyboard"
+    return "bluetooth"
+  }
+}

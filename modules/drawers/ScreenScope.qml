@@ -1,0 +1,1792 @@
+import QtQuick
+import QtQuick.Effects
+import Quickshell
+import Quickshell.Io
+import Quickshell.Wayland
+import Quickshell.Hyprland
+import "../.."
+import "../../core/Screens.js" as Screens
+
+// Everything on one monitor, laid out like Caelestia's drawers window: a
+// full-screen layer whose background is one SDF blob (frame + drawers, with a
+// soft shadow), the bar on one of its edges (the left, in Caelestia), and
+// drawers that grow out of the frame.
+Scope {
+  id: scope
+
+  required property var modelData
+  required property var host
+  readonly property var screen: modelData
+  readonly property var monitor: Hyprland.monitorFor(screen)
+  readonly property var cfg: Config.o
+
+  // The edge the bar is on (Bar.position). Caelestia itself only draws it on
+  // the left; the other edges follow Caelestia KDE's drawers: the panel area is
+  // inset by the bar on its edge, and a right-hand bar mirrors the drawers that
+  // live on the right (session, sidebar, utilities, toasts) over to the left,
+  // out of the popouts' way.
+  // Per screen (core/Screens.js): this screen's own edge (Settings › Taskbar ›
+  // Screens), whether it has a bar at all (Caelestia bar.excludedScreens), and
+  // whether the desktop widgets, toasts and OSD show here.
+  readonly property var connected: Quickshell.screens.map(s => s.name)
+  readonly property string focusedName: Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
+  readonly property string barPos: Screens.edgeFor(screen.name, Screens.positionsFrom(cfg.bar.screenPositions), host.position)
+  readonly property bool barExcluded: !Screens.barOn(screen.name, cfg.bar.excludedScreens, connected)
+  readonly property bool desktopHere: Screens.shownOn(screen.name, cfg.background.excludedScreens)
+  readonly property bool toastsHere: Screens.targetFor(screen.name, cfg.notifs.screen, focusedName, connected)
+  readonly property bool osdHere: Screens.targetFor(screen.name, cfg.osd.screen, focusedName, connected)
+  readonly property bool barVert: barPos === "left" || barPos === "right"
+  readonly property bool mirror: barPos === "right"
+  // A bottom bar puts utilities on top and the notification sidebar under it
+  // (the other way round from every other edge), so the bar's popouts and the
+  // utilities' hover corner don't share the bottom-right of the screen.
+  readonly property bool flipV: barPos === "bottom"
+
+  // ---------------------------------------------------------- state
+  property bool launcher: false
+  property string launchPendingMode: ""
+  property bool dashboard: false
+  property bool session: false
+  property bool settings: false
+  // The modal Settings drawer and the sidebar must not cover each other.
+  onSettingsChanged: if (settings) sidebar = false
+  property bool sidebar: false
+  // Caelestia's NotifDock clears every popup as it opens, and Notifs shows
+  // none while it stays open: the toasts are dismissed, not just hidden.
+  onSidebarChanged: if (sidebar) {
+    settings = false
+    // Release the previous popout (and its keyboard grab) to the sidebar.
+    popout = ""
+    if (NotifService.popups.length) NotifService.dismissAllPopups()
+  }
+  Connections {
+    target: NotifService
+    function onPopupsChanged() { if (scope.sidebar && NotifService.popups.length) Qt.callLater(NotifService.dismissAllPopups) }
+  }
+  property bool utilities: false
+  property bool overview: false
+  // Caelestia's OSD (modules/osd/Wrapper.qml): out on a volume or brightness
+  // change for hideDelay, or while the pointer is on it.
+  property bool osd: false
+  property bool osdHovered: false
+  // hold: 0 is hideDelay, a longer time an Omarchy OSD asked for, -1 out
+  // until Omarchy closes it (OsdService.dismissed).
+  property int osdHold: 0
+  function showOsd(hold) {
+    if (hasFullscreen || !cfg.osd.enabled || !osdHere) return
+    osdHold = hold || 0
+    osd = true
+    if (osdHold < 0) osdTimer.stop()
+    else osdTimer.restart()
+  }
+  Timer {
+    id: osdTimer
+    interval: Math.max(scope.osdHold, scope.cfg.osd.hideDelay)
+    onTriggered: if (!scope.osdHovered) scope.osd = false
+  }
+  Connections {
+    target: OsdService
+    function onRequested(hold) { scope.showOsd(hold) }
+    function onDismissed() { if (!scope.osdHovered) scope.osd = false }
+  }
+  property bool dashShortcut: false
+  // Utilities opened by a shortcut/click stay open; opened by hovering the
+  // bottom-right corner they close once the cursor leaves (Caelestia Interactions).
+  property bool utilShortcut: false
+  property bool barHover: false
+  // `omarchy toggle bar` (SUPER+SHIFT+SPACE) takes the bar column away and
+  // nothing else: the frame, the reserved edges and every drawer stay, as in
+  // Caelestia's non-persistent bar at rest. What points at the bar (its
+  // popouts, its focus mode, the hover reveal, the wheel) is off meanwhile.
+  // Omarchy's bar toggle, or no bar on this screen: the frame and the drawers stay.
+  readonly property bool barOff: host.barHidden || barExcluded
+  onBarOffChanged: if (barOff) {
+    barFocus = false
+    popout = ""
+    barHover = false
+  }
+  property string popout: ""
+  property real popoutCenter: 0
+  property var trayItem: null
+  // Popouts the pointer leaving doesn't close. The tray menu is still swapped
+  // by hovering another bar icon; the two that take the keyboard (Caelestia's
+  // wirelesspassword and the detached winfo) are "held": only Escape, their own
+  // buttons or a click outside (the focus grab clearing) put them away, so
+  // crossing the bar doesn't throw away a half-typed password.
+  //
+  // A popout opened from the keyboard (an Omarchy panel hotkey, IPC) is held
+  // too: hovering the bar doesn't swap it, and it has the keys. One opened by
+  // the pointer stays exactly Caelestia's.
+  property bool popoutKeys: false
+  // SUPER+CTRL+0: the bar itself has the keyboard (BarContent's cursor).
+  property bool barFocus: false
+  onBarFocusChanged: {
+    if (barFocus) {
+      if (!cfg.bar.persistent) barHover = true
+      win.primeFocus()
+    } else if (!cfg.bar.persistent && popout === "") barHover = false
+  }
+  // The bar focus mode switching workspace: Hyprland takes the keyboard (and
+  // clears the grab), so take both back rather than treat it as a click away.
+  function switchWorkspace(id) {
+    Sys.workspace(id)
+    wsSettle.restart()
+    win.regrab()
+  }
+  Timer { id: wsSettle; interval: 600 }
+  // ---------------------------------------------------- drawer keys
+  //
+  // No Caelestia original (its drawers are pointer-only). The dashboard
+  // opened by its shortcut, the sidebar, and utilities opened by theirs take
+  // the keyboard, and one spatial cursor (NavCursor) walks whatever of them
+  // is open -- the sidebar and utilities share a panel, so j/k run from one
+  // into the other. Settings keeps its own focus and hands its keys over
+  // through keyHook. Omarchy's panel keys (KeyNav), plus Tab / 1..4 for
+  // dashboard tabs and Shift+X to clear the notifications.
+  readonly property bool drawerKeys: !popoutHeld && !barFocus && !launcher && !session && !overview && !settings
+    && (sidebar || (dashboard && dashShortcut) || (utilities && utilShortcut))
+  onDrawerKeysChanged: if (drawerKeys) win.primeFocus()
+
+  NavCursor {
+    id: drawerNav
+    space: win.contentItem
+    active: scope.drawerKeys || scope.settings
+    roots: scope.settings ? (scope.nexus && scope.nexus.navRoots ? scope.nexus.navRoots : [])
+      : [].concat(scope.dashboard && scope.dash ? scope.dash.navRoots : [],
+                  scope.sidebar && scope.sidebarPanel ? scope.sidebarPanel.navRoots : [],
+                  (scope.utilities || scope.sidebar) && scope.util ? scope.util.navRoots : [])
+  }
+  KeyNav {
+    id: drawerKeyNav
+    onMoveRequested: (dx, dy) => drawerNav.move(dx, dy)
+    onActivateRequested: drawerNav.activate()
+    onCloseRequested: {
+      scope.dashboard = false; scope.dashShortcut = false
+      scope.sidebar = false; scope.utilities = false
+    }
+    onTabRequested: d => drawerNav.next(d)
+    onDeleteRequested: drawerNav.remove()
+    onTextKey: t => {
+      const h = drawerNav.nearest(drawerNav.cursor, "navText") || drawerNav.roots.find(r => typeof r.navText === "function")
+      if (h) h.navText(t)
+    }
+  }
+  function drawerKey(e) {
+    if (e.text === "X") {
+      if (sidebar && sidebarPanel) sidebarPanel.navClearAll()
+      e.accepted = true
+      return
+    }
+    if (dashboard && dash && !settings) {
+      const onTabs = drawerNav.cursor && dash.inTabBar(drawerNav.cursor)
+      if (e.key === Qt.Key_Tab || e.key === Qt.Key_Backtab) {
+        dash.navTab((e.modifiers & Qt.ShiftModifier) || e.key === Qt.Key_Backtab ? -1 : 1)
+        if (onTabs) drawerNav.setCursor(dash.navTabStop())
+        e.accepted = true
+        return
+      }
+      if (e.text.length === 1 && e.text >= "1" && e.text <= "9") {
+        dash.navTabAt(Number(e.text))
+        if (onTabs) drawerNav.setCursor(dash.navTabStop())
+        e.accepted = true
+        return
+      }
+    }
+    drawerKeyNav.handle(e)
+  }
+
+  // After another surface of ours unmaps (the toasts), whatever holds the
+  // keyboard takes it again: a primed one re-primes, the rest re-grab.
+  function retakeKeys() {
+    if (popoutKeys || barFocus || drawerKeys) win.primeFocus()
+    else if (win.grabWanted) win.regrab()
+  }
+
+  function toggleBarFocus() {
+    if (barOff) return
+    if (barFocus) { barFocus = false; return }
+    closeAll()
+    barFocus = true
+  }
+  readonly property bool popoutHeld: popout === "wirelesspassword" || popout === "winfo" || popoutKeys
+  readonly property bool popoutSticky: popout === "traymenu" || popoutHeld
+  // The network the password popout is asking for.
+  property string passwordSsid: ""
+
+  // The drawers, while they exist. As in Caelestia's drawer Wrappers
+  // (`Loader { active: shouldBeActive || visible }`), each one is only built
+  // while it is open or animating out, and destroyed once it has gone: kept
+  // around they cost ~150 MB (their items, and a font engine per text style).
+  readonly property var dash: dashLoader.item
+  readonly property var launch: launchLoader.item
+  readonly property var sess: sessLoader.item
+  readonly property var sidebarPanel: sidebarLoader.item
+  readonly property var util: utilLoader.item
+  readonly property var overviewContent: overviewLoader.item
+  readonly property var nexus: nexusLoader.item
+  // What a rebuilt drawer should come back to: the dashboard's tab and the
+  // settings page (with its back stack) the user left them on.
+  property int dashTab: 0
+  property string nexusPage: "style"
+  property var nexusStack: []
+  // ScreenScope under a name no drawer shadows: Sidebar and Utilities have a
+  // `scope` property of their own, which a binding inside their (inline,
+  // on-demand) component would resolve `scope` to.
+  readonly property var screenScope: scope
+
+  onPopoutChanged: if (popout === "") {
+    if (popoutKeys && !cfg.bar.persistent && !barFocus) barHover = false
+    popoutKeys = false
+    // A popout opened from the bar focus mode gives the keys back to it.
+    if (barFocus) Qt.callLater(() => bar.takeKeys())
+  }
+
+  // Open a bar popout with the keyboard (Bar.summonBarWidget, IPC popout).
+  // Opens, never toggles: the host asks isBarWidgetOpen first.
+  function openPopoutKeys(name) {
+    if (barOff) return
+    if (session) session = false
+    popoutCenter = bar.popoutCenterFor(name)
+    popoutKeys = true
+    popout = name
+    if (!cfg.bar.persistent) barHover = true
+    win.primeFocus()
+  }
+  // The status group's popouts that have an icon on the bar, in bar order.
+  function statusPopouts() { return bar.statusPopouts() }
+  // Tab in a keyboard popout: the next status popout down the bar, wrapping
+  // (from one that isn't a status popout, the first or last).
+  function tabPopout(d) {
+    const list = statusPopouts()
+    if (!list.length) return
+    const i = list.indexOf(popout)
+    const next = i < 0 ? (d > 0 ? 0 : list.length - 1) : (i + d + list.length) % list.length
+    if (list[next] !== popout) openPopoutKeys(list[next])
+  }
+
+  Component.onCompleted: host.registerScope(scope)
+  Component.onDestruction: host.unregisterScope(scope)
+
+  function closeAll() {
+    barFocus = false
+    launcher = false; session = false; dashboard = false; dashShortcut = false; popout = ""; settings = false; sidebar = false; utilities = false; overview = false
+  }
+
+  onUtilitiesChanged: utilShortcut = utilities && !interactions.inBottomUtil(interactions.mouseX, interactions.mouseY)
+
+  Connections {
+    target: scope.host
+    function onToggleRequested(name, screenName, arg) {
+      if (screenName !== scope.screen.name) return
+      if (name === "close") { scope.closeAll(); return }
+      // Caelestia only reaches the window info panel from the active-window
+      // popout; the IPC opens it straight away, centred on the bar.
+      if (name === "windowInfo") {
+        if (scope.popout === "winfo") scope.popout = ""
+        else { scope.popoutCenter = scope.barVert ? scope.screen.height / 2 : scope.screen.width / 2; scope.popout = "winfo" }
+        return
+      }
+      if (name === "launcher" && scope.cfg.launcher.enabled) {
+        // With a mode ("wallpaper" / "theme" / "menu" / "clipboard") it opens
+        // onto it, and only closes if that mode is already showing.
+        const mode = arg === "wallpaper" ? "wallpapers" : arg === "theme" ? "themes" : arg === "menu" ? "menu" : arg === "clipboard" ? "clipboard" : ""
+        if (mode && !(scope.launcher && launch && launch.mode === mode)) {
+          scope.launchPendingMode = arg
+          scope.launcher = true
+          if (launch && typeof launch.openMode === "function") {
+            launch.openMode(arg)
+            scope.launchPendingMode = ""
+          }
+        }
+        else scope.launcher = !scope.launcher
+      }
+      else if (name === "session" && scope.cfg.session.enabled) scope.session = !scope.session
+      else if (name === "settings") {
+        // With a page id it opens (never toggles) straight onto that page.
+        if (arg) {
+          // From a popout's settings button: that popout's blob becomes
+          // Settings, travelling to the middle as it grows (Caelestia
+          // bar/popouts/Wrapper.qml detach("any")).
+          if (!scope.settings) win.handOffPopout()
+          scope.popout = ""; scope.settings = true; nexus.go(arg)
+        }
+        else {
+          // Settings suspends hover handling, so dismiss the popout before it can get stuck.
+          if (!scope.settings) scope.popout = ""
+          scope.settings = !scope.settings
+        }
+      }
+      // The session menu stays: it moves over to sit against the sidebar.
+      else if (name === "sidebar" && (!scope.cfg.sidebar || scope.cfg.sidebar.enabled)) scope.sidebar = !scope.sidebar
+      else if (name === "utilities" && (!scope.cfg.utilities || scope.cfg.utilities.enabled)) {
+        if (scope.session) scope.session = false
+        scope.utilities = !scope.utilities
+      }
+      else if (name === "overview" && scope.cfg.overview.enabled) {
+        if (!scope.overview) scope.closeAll()
+        scope.overview = !scope.overview
+      }
+      else if (name === "dashboard" && scope.cfg.dashboard.enabled) {
+        if (arg && scope.dashboard && dash) { dash.selectTab(arg); return }
+        scope.dashboard = !scope.dashboard
+        scope.dashShortcut = scope.dashboard
+        if (arg && dash) dash.selectTab(arg)
+      }
+    }
+  }
+
+  // ------------------------------------------------------ fullscreen
+  // Real fullscreen only (`fullscreen` 2), Caelestia's test in
+  // ContentWindow.qml. Not the workspace's `hasfullscreen`, which is also true
+  // for a maximized window (SUPER+ALT+F, "Full width"): that one leaves our
+  // top-layer surface and the reserved edges alone, so the frame stays.
+  readonly property bool hasFullscreen: {
+    const ws = monitor ? monitor.activeWorkspace : null
+    return !!(ws && ws.toplevels.values.some(t => t.lastIpcObject && t.lastIpcObject.fullscreen > 1))
+  }
+  Connections {
+    target: Hyprland
+    function onRawEvent(e) {
+      if (e.name === "fullscreen" || e.name === "workspace" || e.name === "closewindow") {
+        Hyprland.refreshWorkspaces()
+        Hyprland.refreshToplevels()
+      }
+    }
+  }
+  onHasFullscreenChanged: {
+    osd = false
+    osdHovered = false
+    launcher = false
+    session = false
+    dashboard = false
+    dashShortcut = false
+    popout = ""
+    sidebar = false
+    utilities = false
+  }
+
+  // --------------------------------------------- reserved screen edges
+  component Reserve: PanelWindow {
+    screen: scope.screen
+    WlrLayershell.namespace: "omacale-reserve"
+    mask: Region {}
+    implicitWidth: 1
+    implicitHeight: 1
+    color: "transparent"
+  }
+  // What an edge reserves: the frame's border, or the bar's breadth on its own.
+  function zoneFor(edge) {
+    return edge === barPos && cfg.bar.persistent && !barOff ? Tk.barWidth : Tk.border
+  }
+  Reserve { anchors.left: true; exclusiveZone: scope.zoneFor("left") }
+  Reserve { anchors.top: true; exclusiveZone: scope.zoneFor("top") }
+  Reserve { anchors.right: true; exclusiveZone: scope.zoneFor("right") }
+  Reserve { anchors.bottom: true; exclusiveZone: scope.zoneFor("bottom") }
+
+  // Desktop clock and visualiser, under the windows (Caelestia's background).
+  // The desktop clock and visualiser, on the screens they aren't excluded from.
+  LazyLoader {
+    active: scope.desktopHere
+    Background {
+      screen: scope.screen
+      barPos: scope.barPos
+      barZone: scope.zoneFor(scope.barPos)
+    }
+  }
+
+  // The lock card drawn above the session lock, and its closing after
+  // Omarchy has dropped the lock (LockFx, LockUnlockFx). Up from the lock
+  // until the closing has played.
+  LazyLoader {
+    active: !!LockFx.screens[scope.screen.name]
+    LockUnlockFx {
+      shellScreen: scope.screen
+    }
+  }
+
+  // ----------------------------------------------- notification toasts
+  //
+  // Deliberately NOT part of the frame window below. That one sits on
+  // Hyprland's `top` layer, which a fullscreen window draws over, and it goes
+  // away with the bar -- a notification a video can hide is not a
+  // notification. The toasts get their own `overlay` surface (where Omarchy's
+  // stock toasts live too) and stay up over anything.
+  //
+  // Which means they can't be a shape in the frame's blob shader the way the
+  // other drawers are, so each toast is a card of its own with an elevation
+  // shadow, sitting where the frame's top-right inner corner is.
+  readonly property real toastInset: Tk.border + Math.max(0, Math.min(Tk.padding.large - Tk.border, Tk.padding.large))
+  // Toasts sit in the top-right corner, the top-left one when the bar is on the
+  // right (Caelestia KDE's auto position), and below a bar on the top edge.
+  readonly property real toastTop: toastInset + (barPos === "top" ? Math.max(0, win.bw - Tk.border) : 0)
+
+  PanelWindow {
+    id: toastWin
+
+    screen: scope.screen
+    // Kept up through the outro so the last toast can finish leaving. The
+    // first half of the test is deliberately computed outside this window, so
+    // a surface that was taken down can always bring itself back.
+    visible: NotifService.popupsEnabled && scope.toastsHere
+      && ((NotifService.popups.length > 0 && !toastStack.suppressed) || toastStack.implicitHeight > 0)
+    color: "transparent"
+    exclusionMode: ExclusionMode.Ignore
+    WlrLayershell.namespace: "omacale-notifications"
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+    // One fixed, full-screen surface, as Omarchy's own popup window uses: a
+    // surface that resizes as toasts come and go lets the compositor scale a
+    // stale buffer for a frame, which squashes the cards.
+    anchors { top: true; bottom: true; left: true; right: true }
+
+    // Only the cards themselves take input; everything else on this surface
+    // is click-through, so the overlay never eats a press.
+    mask: Region { item: toastStack }
+
+    // Taking this surface down makes Hyprland hand the keyboard to a window,
+    // even from a panel that holds it: opening the sidebar over a toast (the
+    // toasts get out of its way) or the last toast timing out under an open
+    // drawer left h/j/k/l going to the window behind. Take the keys back.
+    onVisibleChanged: if (!visible) scope.retakeKeys()
+
+    NotifPopups {
+      id: toastStack
+
+      // In the corner by x/y: an anchor that a binding clears doesn't reliably
+      // let go, and the bar can move to the other side while the shell runs.
+      x: scope.mirror ? scope.toastInset : parent.width - width - scope.toastInset
+      y: scope.toastTop
+
+      width: implicitWidth
+      height: implicitHeight
+      // Caelestia notifications/Content.qml: the stack stops short of the
+      // session menu and of utilities (when they share its corner's side).
+      maxHeight: {
+        let h = scope.screen.height - scope.toastTop - scope.toastInset
+        if (scope.session) h = Math.min(h, win.sy - Math.max(0, Tk.padding.large - Tk.border) - scope.toastTop)
+        if (scope.utilities && !scope.flipV)
+          h = Math.min(h, scope.screen.height - win.uh - Tk.border * 2 - Tk.padding.large * 2 - Tk.spacing.extraLarge)
+        return Math.max(0, h)
+      }
+      // The notification centre shows the same notifications in full, so the
+      // toasts get out of its way (Caelestia's Notifs.shouldShowPopup).
+      suppressed: scope.sidebar
+    }
+  }
+
+  // Caelestia's facePicker (dashboard/Wrapper.qml): choose an image and copy
+  // it to ~/.face, which the dashboard and the lock screen read. Omacale's own
+  // FileDialog, not the native one: that one is GTK3's, built inside the shell
+  // process, and a fatal in it took the whole shell down (issue #5).
+  FileDialog {
+    id: facePicker
+    title: "Select a profile picture"
+    filterLabel: "Image files"
+    filters: imageSuffixes
+    onAccepted: path => faceCopy.copy(path)
+  }
+
+  // A file for a Settings page (Settings.fileRequested). The drawer gives way
+  // while the dialog is up, as the dashboard does for the face picker, and
+  // comes back on the same page; the Settings window just stays.
+  property var filePick: null
+  property bool fileReopen: false
+  function requestFile(title, filters, pick, fromDrawer) {
+    filePick = pick
+    fileReopen = fromDrawer
+    filePicker.title = title
+    filePicker.filters = filters
+    if (fromDrawer) settings = false
+    filePicker.open()
+  }
+  // Settings › Wallpaper & style's buttons: the drawer makes way for the picker.
+  function openPicker(kind, fromDrawer) {
+    if (fromDrawer) settings = false
+    if (kind === "theme") host.openThemes()
+    else host.openWallpapers()
+  }
+  FileDialog {
+    id: filePicker
+    filterLabel: "Image files"
+    onAccepted: path => { if (scope.filePick) scope.filePick(path); scope.filePick = null; if (scope.fileReopen) fileReopenTimer.start() }
+    onRejected: { scope.filePick = null; if (scope.fileReopen) fileReopenTimer.start() }
+  }
+  // A beat after the dialog's window goes: Hyprland hands the keyboard back as
+  // it closes, which would clear the drawer's focus grab and close it again.
+  Timer { id: fileReopenTimer; interval: 300; onTriggered: scope.settings = true }
+
+  Process {
+    id: faceCopy
+    property string src: ""
+    readonly property string dest: Quickshell.env("HOME") + "/.face"
+
+    function copy(path) {
+      if (running || !path) return
+      src = path
+      // Picking ~/.face itself: nothing to copy, and cp would fail on it.
+      if (path === dest) { notify(true); return }
+      command = ["cp", "-f", "--", path, dest]
+      running = true
+    }
+
+    function notify(ok) {
+      const shown = src.startsWith(Quickshell.env("HOME") + "/") ? "~" + src.slice(Quickshell.env("HOME").length) : src
+      Quickshell.execDetached(ok
+        ? ["notify-send", "-a", "Omacale", "-u", "low", "-h", "STRING:image-path:" + src, "Profile picture changed", "Profile picture changed to " + shown]
+        : ["notify-send", "-a", "Omacale", "-u", "critical", "Unable to change profile picture", "Failed to change profile picture to " + shown])
+    }
+
+    onExited: code => notify(code === 0)
+  }
+
+  // Settings popped out into a real window.
+  property bool settingsWindow: false
+  LazyLoader {
+    active: scope.settingsWindow
+    FloatingWindow {
+      visible: true
+      title: "Omacale Settings"
+      color: Colours.m3surface
+      implicitWidth: winSettings.implicitWidth
+      implicitHeight: winSettings.implicitHeight
+      minimumSize.width: Tk.sizes.nexusMinWidth
+      minimumSize.height: Tk.sizes.nexusMinHeight
+      onVisibleChanged: if (!visible) scope.settingsWindow = false
+      Settings {
+        id: winSettings
+        anchors.fill: parent
+        isWindow: true
+        screenWidth: scope.screen.width
+        screenHeight: scope.screen.height
+        version: scope.host.version
+        onCloseRequested: scope.settingsWindow = false
+        onFileRequested: (title, filters, pick) => scope.requestFile(title, filters, pick, false)
+        onPickerRequested: kind => scope.openPicker(kind, false)
+      }
+    }
+  }
+
+  PanelWindow {
+    id: win
+
+    screen: scope.screen
+    color: "transparent"
+    exclusionMode: ExclusionMode.Ignore
+    WlrLayershell.namespace: "omacale"
+    WlrLayershell.layer: win.modal ? WlrLayer.Overlay : WlrLayer.Top
+    // A keyboard-opened popout primes Exclusive first, as Omarchy's
+    // KeyboardPanel does: this window is always mapped, and Hyprland doesn't
+    // offer an already-mapped surface the keyboard when it merely changes
+    // from None to OnDemand. OnDemand afterwards gives pointer hit-testing
+    // back to other surfaces (and outputs).
+    WlrLayershell.keyboardFocus: (scope.popoutKeys || scope.barFocus || scope.drawerKeys) && !win.focusPrimed ? WlrKeyboardFocus.Exclusive
+      : scope.launcher || scope.session || scope.settings || scope.overview || scope.popoutHeld || scope.barFocus || scope.drawerKeys ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.None
+    anchors { top: true; bottom: true; left: true; right: true }
+
+    // Fullscreen collapses the frame into the screen edges.
+    property real fs: scope.hasFullscreen ? 1 : 0
+    Behavior on fs { Anim {} }
+
+    // Wallpaper luminance for Colours.layer; one sampler serves every screen.
+    Loader {
+      active: scope.screen === Quickshell.screens[0]
+      sourceComponent: WallLuminance {}
+    }
+    // Auto-hiding bar (Caelestia's non-persistent bar).
+    readonly property bool barShown: !scope.barOff && (scope.cfg.bar.persistent || scope.barHover)
+    property real barProg: barShown ? 1 : 0
+    // Caelestia BarWrapper: out on the default spatial curve, back in on
+    // emphasized.
+    Behavior on barProg { Anim { type: win.barShown ? "spatial" : "emphasized" } }
+
+    // The frame's breadth on the bar's edge (bw) and on the others (bt).
+    readonly property real bw: (Tk.border + (Tk.barWidth - Tk.border) * barProg) * (1 - fs)
+    readonly property real bt: Tk.border * (1 - fs)
+    // Panel area (Caelestia's Panels item)
+    readonly property real ax: scope.barPos === "left" ? bw : bt
+    readonly property real ay: scope.barPos === "top" ? bw : bt
+    readonly property real aw: width - ax - (scope.barPos === "right" ? bw : bt)
+    readonly property real ah: height - ay - (scope.barPos === "bottom" ? bw : bt)
+
+    // Drawers on the right of the screen (the left, with a right-hand bar):
+    // where one of width w sits, off = 0 open to 1 away, and the part of the
+    // area it shows, which is what the input mask keeps. `off` is not
+    // clamped: the spatial curve overshoots, and the drawer comes a few px
+    // off its wall and back, as Caelestia's do (the blob's corner fill keeps
+    // it joined to the frame meanwhile).
+    function sideX(w, off) {
+      return scope.mirror ? ax - (w + 5) * off : ax + aw - w + (w + 5) * off
+    }
+    function sideMaskX(x) { return scope.mirror ? ax : x }
+    function sideMaskW(x, w) { return scope.mirror ? Math.max(0, x + w - ax) : Math.max(0, ax + aw - x) }
+
+    // -------------------------------------------------- drawer motion
+    // Each drawer's 0 open / 1 away: on Caelestia's curves (the *OffC), or,
+    // with liquid motion on for it (Settings › Motion), on its
+    // LiquidDrawer's spring (see "liquid" below).
+    readonly property bool dOpen: scope.dashboard
+    readonly property bool lOpen: scope.launcher
+    readonly property bool sOpen: scope.session
+    // A detached popout flies back to the bar before it slides away.
+    readonly property bool pOpen: scope.popout !== "" || pDet > 0.001
+    readonly property bool nOpen: scope.settings
+    readonly property bool oOpen: scope.overview
+    readonly property bool sbOpen: scope.sidebar
+    // The clipboard preview, out while the launcher shows clipboard rows.
+    readonly property bool cpOpen: scope.launcher && !!launch && launch.previewWanted
+    // Utilities give way to the session menu, unless the sidebar holds them
+    // (Caelestia utilities/Wrapper.qml shouldBeActive).
+    readonly property bool uOpen: scope.sidebar || (scope.utilities && !scope.session)
+    // The OSD gives way to utilities (Caelestia osd/Wrapper.qml shouldBeActive).
+    readonly property bool osdOpen: scope.osd && scope.cfg.osd.enabled && !scope.utilities
+    property real dOffC: dOpen ? 0 : 1
+    property real lOffC: lOpen ? 0 : 1
+    property real sOffC: sOpen ? 0 : 1
+    property real pOffC: pOpen ? 0 : 1
+    property real nOffC: nOpen ? 0 : 1
+    property real oOffC: oOpen ? 0 : 1
+    property real sbOffC: sbOpen ? 0 : 1
+    property real cpOffC: cpOpen ? 0 : 1
+    property real uOffC: uOpen ? 0 : 1
+    property real osdOffC: osdOpen ? 0 : 1
+    Behavior on dOffC { enabled: !dLiq.active; Anim {} }
+    Behavior on lOffC { enabled: !lLiq.active; Anim {} }
+    Behavior on sOffC { enabled: !sLiq.active; Anim {} }
+    Behavior on pOffC { enabled: !pLiq.active; Anim {} }
+    // Caelestia bar/popouts/Wrapper.qml: detach() moves on the slow spatial
+    // curve, close() on the default one.
+    Behavior on nOffC { enabled: !nLiq.active; Anim { type: scope.settings ? "slowSpatial" : "spatial" } }
+    // As Settings: out on the slow spatial curve, back on the default one.
+    // Floating, Settings' curves (slow spatial out, default back); attached
+    // to the top or bottom edge, the dashboard's and launcher's (default
+    // spatial both ways).
+    Behavior on oOffC { enabled: !oLiq.active; Anim { type: scope.overview && !win.oAttached ? "slowSpatial" : "spatial" } }
+    Behavior on sbOffC { enabled: !sbLiq.active; Anim {} }
+    Behavior on cpOffC { enabled: !cpLiq.active; Anim {} }
+    Behavior on uOffC { enabled: !uLiq.active; Anim {} }
+    Behavior on osdOffC { enabled: !osdLiq.active; Anim {} }
+    readonly property real dOff: dLiq.active ? dLiq.off : dOffC
+    readonly property real lOff: lLiq.active ? lLiq.off : lOffC
+    readonly property real sOff: sLiq.active ? sLiq.off : sOffC
+    readonly property real pOff: pLiq.active ? pLiq.off : pOffC
+    readonly property real nOff: nLiq.active ? nLiq.off : nOffC
+    readonly property real oOff: oLiq.active ? oLiq.off : oOffC
+    readonly property real sbOff: sbLiq.active ? sbLiq.off : sbOffC
+    readonly property real cpOff: cpLiq.active ? cpLiq.off : cpOffC
+    readonly property real uOff: uLiq.active ? uLiq.off : uOffC
+    readonly property real osdOff: osdLiq.active ? osdLiq.off : osdOffC
+    // How far each slides. Liquid, never past open: a spring overshoots far
+    // more than Caelestia's curves, and LiquidDrawer.rect turns the
+    // overshoot into length instead, so the drawer stays on its wall. The
+    // drop style grows a drawer in its open place (LiquidDrawer.rect).
+    function slid(liq, off) { return liq.drop ? 0 : liq.active ? Math.max(0, off) : off }
+    readonly property real dS: slid(dLiq, dOff)
+    readonly property real lS: slid(lLiq, lOff)
+    readonly property real sS: slid(sLiq, sOff)
+    readonly property real pS: slid(pLiq, pOff)
+    readonly property real cpS: slid(cpLiq, cpOff)
+    readonly property real osdS: slid(osdLiq, osdOff)
+    readonly property real oS: slid(oLiq, oOff)
+    readonly property real sbS: slid(sbLiq, sbOff)
+    readonly property real uS: slid(uLiq, uOff)
+
+    // Visibility flags
+    readonly property bool dVis: dOff < 1
+    readonly property bool lVis: lOff < 1
+    readonly property bool sVis: sOff < 1
+    readonly property bool pVis: pOff < 1
+    readonly property bool nVis: nOff < 0.999
+    readonly property bool oVis: oOff < 0.999
+    // Settings and the overview are modal: the whole screen takes input so a
+    // press outside them closes, and the other drawers stop carving the mask.
+    readonly property bool modal: nVis || oVis
+    readonly property bool uVis: uOff < 1
+    readonly property bool sbVis: sbOff < 1
+    readonly property bool osdVis: osdOff < 1
+
+    // Dashboard (top centre)
+    readonly property real dw: (dash && dash.implicitWidth) || Tk.px(854)
+    readonly property real dh: (dash && dash.implicitHeight) || Tk.px(540)
+    readonly property real dx: ax + Math.round((aw - dw) / 2)
+    readonly property real dy: ay + (-dh - 5) * dS
+    // Launcher (bottom centre)
+    readonly property real lw: (launch && launch.implicitWidth) || Tk.px(640)
+    property real lh: (launch && launch.implicitHeight) || Tk.px(420)
+    readonly property real lx: ax + Math.round((aw - lw) / 2)
+    readonly property real ly: ay + ah - lh + (lh + 5) * lS
+    // Clipboard preview (bottom, right of the launcher), Caelestia PR #1298's
+    // ClipboardPreview: its own panel a gap from the launcher, sized to what
+    // it shows (ClipboardPreview.fit): an image to its aspect ratio, up to the
+    // room right of the launcher; text 400px wide and as tall as the text.
+    // Neither is ever taller than the launcher itself. The last row stays on it while it slides away.
+    readonly property bool cpVis: cpOff < 1
+    property var cpRow: null
+    readonly property real cpPadH: Tk.padding.large * 2
+    readonly property real cpPadV: Tk.padding.large + Math.max(0, Tk.padding.large - Tk.border)
+    // The PR's gap is spacing.large + 4. Here it is two frame fillets wide,
+    // so each panel's arc into the frame is full-size and the two meet flat
+    // on it as one round U (blob.frag narrows them if it is ever less).
+    readonly property real cpGap: Tk.smoothing * 2
+    readonly property real cpMaxW: Math.max(Tk.px(200), Math.min(Tk.px(640), ax + aw - (lx + lw + cpGap) - Tk.padding.large) - cpPadH)
+    readonly property real cpMaxH: Math.max(Tk.px(80), lh - cpPadV)
+    readonly property size cpFit: cpLoader.item ? cpLoader.item.fit : Qt.size(0, 0)
+    readonly property real cpTextW: Tk.px(400) - cpPadH
+    property real cpw: cpFit.width > 0 ? cpFit.width + cpPadH : Tk.px(400)
+    property real cph: cpFit.height > 0 ? cpFit.height + cpPadV : lh
+    Behavior on cpw { enabled: win.cpOff < 1; Anim {} }
+    Behavior on cph { enabled: win.cpOff < 1; Anim {} }
+    readonly property real cpx: lx + lw + cpGap
+    readonly property real cpy: ay + ah - cph + (cph + 5) * cpS
+    // Session (right centre). With the sidebar out it sits against the
+    // sidebar instead of the frame, and slides out from behind it, clipped at
+    // its edge (Caelestia Panels.qml sessionWrapper, session/Wrapper.qml
+    // sidebarOffset).
+    readonly property real sw: (sess && sess.implicitWidth) || Tk.px(420)
+    readonly property real sh: (sess && sess.implicitHeight) || Tk.px(300)
+    readonly property real sShift: sbVis ? sbw * (1 - sbOff) : 0
+    readonly property real sHide: sw + 5 + (sbVis ? 14 : 0)
+    readonly property real sx: scope.mirror ? ax + sShift - sHide * sS : ax + aw - sShift - sw + sHide * sS
+    readonly property real sy: ay + Math.round((ah - sh) / 2)
+    // The session's clip: the panel area short of the sidebar.
+    readonly property real sClipX: scope.mirror ? ax + sShift : ax
+    readonly property real sClipW: Math.max(0, aw - sShift)
+    readonly property real sMaskX: Math.max(sx, sClipX)
+    readonly property real sMaskW: Math.max(0, Math.min(sx + sw, sClipX + sClipW) - sMaskX)
+    // OSD (right centre, the left with a right-hand bar). It comes out of
+    // whatever is open on that edge -- the session menu, the sidebar, or the
+    // frame -- sliding from behind it (Caelestia Panels.qml osdWrapper, whose
+    // right margin is the session's visible width past the sidebar's).
+    readonly property real osdW: osdLoader.item ? osdLoader.item.implicitWidth : 0
+    readonly property real osdH: osdLoader.item ? osdLoader.item.implicitHeight : 0
+    readonly property real osdShift: (sbVis ? sbw * (1 - sbOff) : 0) + (sVis ? sw * (1 - sOff) : 0)
+    readonly property real osdHide: osdW + 5 + (sbVis || sVis ? 12 : 0)
+    readonly property real osdX: scope.mirror ? ax + osdShift - osdHide * osdS : ax + aw - osdShift - osdW + osdHide * osdS
+    readonly property real osdY: ay + Math.round((ah - osdH) / 2)
+    // The edge it comes out of, and the part of it the panel area shows.
+    readonly property real osdEdge: scope.mirror ? ax + osdShift : ax + aw - osdShift
+    readonly property real osdMaskX: scope.mirror ? Math.max(osdEdge, osdX) : osdX
+    readonly property real osdMaskW: scope.mirror ? Math.max(0, osdX + osdW - osdMaskX) : Math.max(0, Math.min(osdX + osdW, osdEdge) - osdX)
+    // Popout (against the bar's edge, beside its icon)
+    // Caelestia's ClipWrapper places the popout from the page's final size
+    // (nonAnimHeight), so it moves straight to its spot while the size
+    // animates; placing it from the animated `ph` made it drift.
+    readonly property real pwTarget: pop.implicitWidth + Tk.padding.large * 2
+    readonly property real phTarget: pop.implicitHeight + Tk.padding.large * 2
+    property real pw: pwTarget
+    property real ph: phTarget
+    // Opening from closed: a page's Layout only reports its size on the next
+    // polish, after pOff has started moving. Snap until it has settled, so the
+    // popout opens in place instead of sliding from the last page's geometry.
+    property bool pSettled: true
+    Timer { id: pSettle; interval: 60; onTriggered: win.pSettled = true }
+    Connections {
+      target: scope
+      function onPopoutChanged() {
+        if (scope.popout !== "") win.pHandoff = false
+        if (scope.popout !== "" && win.pOff >= 0.999) { win.pSettled = false; pSettle.restart() }
+      }
+    }
+    readonly property bool pAnimate: pOff < 1 && pSettled
+    property real pFade: scope.popout !== "" ? 1 : 0
+    Behavior on pFade { Anim { type: "effects" } }
+    Behavior on pw { enabled: win.pAnimate; Anim {} }
+    Behavior on ph { enabled: win.pAnimate; Anim {} }
+    // Along the bar: centred on its icon, kept inside the panel area.
+    property real pa: {
+      const size = scope.barVert ? phTarget : pwTarget
+      const lo = scope.barVert ? ay : ax
+      const span = scope.barVert ? ah : aw
+      return Math.max(lo, Math.min(scope.popoutCenter - size / 2, lo + span - size))
+    }
+    Behavior on pa { enabled: win.pAnimate; Anim {} }
+    // Across the bar: out of its edge, sliding in from behind it. A popout
+    // pressed against an end of the panel area squares its corner there by
+    // itself (the blob's corner fill), as Caelestia's does.
+    readonly property real pax: scope.barVert ? (scope.barPos === "left" ? ax + (-pw - 5) * pS : ax + aw - pw + (pw + 5) * pS) : pa
+    readonly property real pay: scope.barVert ? pa : (scope.barPos === "top" ? ay + (-ph - 5) * pS : ay + ah - ph + (ph + 5) * pS)
+    // Detached (the window info panel): the popout leaves the bar and floats
+    // in the middle of the panel area over a scrim, and on closing flies back
+    // to the bar before it slides in (Caelestia bar/popouts/Wrapper.qml
+    // detach(), ClipWrapper.qml).
+    readonly property bool pDetachWanted: scope.popout === "winfo"
+    property real pDetC: pDetachWanted ? 1 : 0
+    Behavior on pDetC { enabled: !pLiq.active; Anim {} }
+    // Liquid, the flight is a spring too; it stops at the bar on the way back.
+    Spring {
+      id: pDetSpring
+      live: pLiq.active
+      target: win.pDetachWanted ? 1 : 0
+      absorb: 0
+      stiffness: Liquid.stiffness
+      damping: Liquid.damping
+    }
+    readonly property real pDet: pLiq.active ? pDetSpring.value : pDetC
+    readonly property real px: pax + (ax + Math.round((aw - pw) / 2) - pax) * pDet
+    readonly property real py: pay + (ay + Math.round((ah - ph) / 2) - pay) * pDet
+    // What of it the panel area shows.
+    readonly property real pcx: Math.max(ax, px)
+    readonly property real pcy: Math.max(ay, py)
+    readonly property real pcw: Math.max(0, Math.min(ax + aw, px + pw) - pcx)
+    readonly property real pch: Math.max(0, Math.min(ay + ah, py + ph) - pcy)
+    // The shader rect reaches 20% behind the bar so the popout never comes
+    // off it, even squashed by its deformation (Caelestia's extraWidth, gone
+    // once detached).
+    readonly property real pExtra: 0.2 * (1 - pDet)
+    readonly property real prx: px - (scope.barPos === "left" ? pw * pExtra : 0)
+    readonly property real pry: py - (scope.barPos === "top" ? ph * pExtra : 0)
+    readonly property real prw: scope.barVert ? pw * (1 + pExtra) : pw
+    readonly property real prh: scope.barVert ? ph : ph * (1 + pExtra)
+    // Settings (floating, centred). In Caelestia the in-shell Nexus is always
+    // a detached popout (bar/popouts/Wrapper.qml detach(), ClipWrapper.qml):
+    // the popout's rect leaves the bar for the middle of the screen while it
+    // grows into the Nexus, and on closing flies back and slides into the
+    // bar. It never inflates in place.
+    readonly property real nfw: nexus ? nexus.implicitWidth : 0
+    readonly property real nfh: nexus ? nexus.implicitHeight : 0
+    // Opened from a popout, it starts as that popout's rect and goes back
+    // to the bar and into it on closing.
+    property var nOrigin: null
+    // The popout whose blob has become Settings: drawn no more, its slide
+    // away left to finish unseen.
+    property bool pHandoff: false
+    function handOffPopout() {
+      if (!pVis || pOff > 0.5 || scope.popout === "" || pDetachWanted) return
+      nOrigin = [prx, pry, prw, prh]
+      pHandoff = true
+    }
+    // The popout's rect slid all the way behind the bar.
+    readonly property var nOriginAway: !nOrigin ? null
+      : scope.barPos === "left" ? [nOrigin[0] - pw - 5, nOrigin[1], nOrigin[2], nOrigin[3]]
+      : scope.barPos === "right" ? [nOrigin[0] + pw + 5, nOrigin[1], nOrigin[2], nOrigin[3]]
+      : scope.barPos === "top" ? [nOrigin[0], nOrigin[1] - ph - 5, nOrigin[2], nOrigin[3]]
+      : [nOrigin[0], nOrigin[1] + ph + 5, nOrigin[2], nOrigin[3]]
+    // Opened any other way (shortcut, IPC, utilities, the launcher): as if
+    // detached from a popout in the middle of the bar, that is, from a
+    // popout-sized rect behind the bar's edge (Caelestia's ClipWrapper
+    // offsetScale 1), which it also goes back behind.
+    readonly property real n0w: Math.round(nfw * 0.25)
+    readonly property real n0h: Math.round(nfh * 0.4)
+    readonly property var nBarOrigin: scope.barPos === "left" ? [ax - n0w - 5, ay + Math.round((ah - n0h) / 2), n0w, n0h]
+      : scope.barPos === "right" ? [ax + aw + 5, ay + Math.round((ah - n0h) / 2), n0w, n0h]
+      : scope.barPos === "top" ? [ax + Math.round((aw - n0w) / 2), ay - n0h - 5, n0w, n0h]
+      : [ax + Math.round((aw - n0w) / 2), ay + ah + 5, n0w, n0h]
+    readonly property var nFrom: nOrigin ? (scope.settings ? nOrigin : nOriginAway) : nBarOrigin
+    function nLerp(a, b) { return a + (b - a) * (1 - nOff) }
+    readonly property real nw: nLerp(nFrom[2], nfw)
+    readonly property real nh: nLerp(nFrom[3], nfh)
+    readonly property real nx: nLerp(nFrom[0], ax + Math.round((aw - nfw) / 2))
+    readonly property real ny: nLerp(nFrom[1], ay + Math.round((ah - nfh) / 2))
+    // Caelestia's Comp: the Nexus fades in (default effects) as soon as it
+    // is loaded, while the panel is still on its way, and out as it leaves.
+    property real nFade: scope.settings ? 1 : 0
+    Behavior on nFade { Anim { type: "effects" } }
+    onNVisChanged: if (!nVis && !scope.settings) nOrigin = null
+    onPOffChanged: if (pOff >= 1) pHandoff = false
+    // Overview. Floating (the middle, or a detached top/bottom), it grows
+    // out of its own centre to its full size, Settings' motion with the
+    // origin on the overview instead of the bar: a grid spanning workspaces
+    // 3 to 7 starts at 5. Attached to the top or bottom (Settings › Panels ›
+    // Overview › Position) it slides out of that frame edge at full size,
+    // as the dashboard and launcher do.
+    readonly property string oPos: scope.cfg.overview.position
+    // Detached, a top/bottom overview floats like the middle one, a gap off
+    // its frame edge, instead of growing out of it.
+    readonly property bool oAttached: oPos !== "middle" && !scope.cfg.overview.detached
+    readonly property real oGap: oAttached ? 0 : scope.cfg.overview.gap
+    readonly property real ofw: overviewContent ? overviewContent.implicitWidth : 0
+    readonly property real ofh: overviewContent ? overviewContent.implicitHeight : 0
+    // Where it sits open.
+    readonly property real oTx: ax + Math.round((aw - ofw) / 2)
+    readonly property real oTy: oPos === "top" ? ay + oGap : oPos === "bottom" ? ay + ah - ofh - oGap : ay + Math.round((ah - ofh) / 2)
+    // Floating: a rect a quarter as wide and 40% as tall, centred on it.
+    readonly property real o0w: Math.round(ofw * 0.25)
+    readonly property real o0h: Math.round(ofh * 0.4)
+    function oLerp(a, b) { return a + (b - a) * (1 - oOff) }
+    readonly property real ow: oAttached ? ofw : oLerp(o0w, ofw)
+    readonly property real oh: oAttached ? ofh : oLerp(o0h, ofh)
+    readonly property real ox: oAttached ? oTx : oTx + Math.round((ofw - ow) / 2)
+    readonly property real oy: !oAttached ? oTy + Math.round((ofh - oh) / 2)
+      : oPos === "top" ? ay + (-ofh - 5) * oS : ay + ah - ofh + (ofh + 5) * oS
+    // Floating, Settings' fade (in as soon as it loads, out as it leaves);
+    // attached, the dashboard's (with its slide).
+    property real oFade: scope.overview ? 1 : 0
+    Behavior on oFade { Anim { type: "effects" } }
+    readonly property real oOpacity: oAttached ? Math.max(0, 1 - oOff) : oFade
+    // Sidebar (top right, above utilities)
+    readonly property real sbw: Tk.sizes.sidebarWidth
+    readonly property real sbx: sideX(sbw, sbS)
+    readonly property real sby: scope.flipV ? Math.min(ay + ah, uy + uh) : ay
+    // Anchored to the utilities' top edge, as Caelestia's Sidebar.Wrapper.
+    readonly property real sbh: scope.flipV ? Math.max(0, ay + ah - sby) : Math.max(0, Math.min(ah, uy - ay))
+    // Utilities (bottom right), sliding up out of the bottom edge like
+    // Caelestia's Utilities.Wrapper. While the sidebar is open it takes the
+    // sidebar's visible width, so the two drawers share one straight side.
+    property real sbLerp: scope.sidebar ? 1 : 0
+    Behavior on sbLerp {
+      Anim {
+        duration: Tk.durations.defaultSpatial / 2
+        easing.bezierCurve: scope.sidebar ? Tk.curves.standardAccel : Tk.curves.standardDecel
+      }
+    }
+    // The sidebar's width including its overshoot, widened by half its
+    // horizontal stretch while it deforms (ContentWindow.qml
+    // utilities.horizontalStretch).
+    readonly property real uHStretch: (sbDeform.m00 - 1) / 2 + 1
+    readonly property real uw: sbw * (1 - sbOff) * uHStretch * sbLerp + Tk.sizes.utilitiesWidth * (1 - sbLerp)
+    readonly property real uh: (util && util.implicitHeight > 0) ? util.implicitHeight : Tk.px(450)
+    readonly property real ux: scope.mirror ? ax : ax + aw - uw
+    readonly property real uy: scope.flipV ? ay - (uh + 5) * uS : ay + ah - uh + (uh + 5) * uS
+    // The part of it the panel area shows.
+    readonly property real uMaskY: scope.flipV ? Math.max(ay, uy) : uy
+    readonly property real uMaskH: scope.flipV ? Math.max(0, uy + uh - uMaskY) : Math.max(0, ay + ah - uy)
+    // The sidebar's shader rect: 2px over the utilities so the join never
+    // shows a seam, and taller by its vertical squash so a deformed sidebar
+    // still reaches them (ContentWindow.qml sidebarBg implicitHeight).
+    readonly property real sbRectH: sbh / Math.max(0.5, sbDeform.m11) + 2
+    readonly property real sbRectY: scope.flipV ? sby + sbh - sbRectH : sby
+    // Caelestia's PanelBg: the corners they share square up over the last
+    // 30% of the sidebar's slide, and their fillet is dropped once it is
+    // within 8% of in place.
+    // Toasts (Caelestia Panels.qml): beside the sidebar, above utilities --
+    // at the bottom of the area while the sidebar is out, or when a bottom
+    // bar has put utilities at the top.
+    readonly property real tw: toastsView.implicitWidth
+    readonly property real th: toastsView.implicitHeight
+    readonly property real tEdge: scope.mirror ? Math.max(ax, sbx + sbw) : Math.min(ax + aw, sbx)
+    readonly property real tBottom: sbVis || scope.flipV ? ay + ah : Math.min(ay + ah, uy)
+    readonly property real tx: scope.mirror ? tEdge + Tk.padding.medium : tEdge - Tk.padding.medium - tw
+    readonly property real ty: tBottom - Tk.padding.medium - th
+    readonly property real joinRound: Math.max(0, Math.min(1, sbOff / 0.3))
+    readonly property bool joinExcluded: sbOff <= 0.08
+
+    // ------------------------------------------------------ input mask
+
+    mask: Region {
+      x: 0
+      y: 0
+      width: win.width
+      height: win.height
+
+      // Subtract the central desktop area where applications receive input.
+      Region {
+        intersection: Intersection.Subtract
+        x: win.ax
+        y: win.ay
+        width: !win.modal && win.fs < 1 ? win.aw : 0
+        height: !win.modal && win.fs < 1 ? win.ah : 0
+
+        // Re-include open drawers within the work area so they receive input:
+        Region { intersection: Intersection.Subtract; x: win.dx; y: win.ay; width: (scope.dashboard || win.dVis) ? win.dw : 0; height: (scope.dashboard || win.dVis) ? Math.max(0, win.dy + win.dh - win.ay) : 0 }
+        Region { intersection: Intersection.Subtract; x: win.lx; y: win.ly; width: (scope.launcher || win.lVis) ? win.lw : 0; height: (scope.launcher || win.lVis) ? Math.max(0, win.ay + win.ah - win.ly) : 0 }
+        Region { intersection: Intersection.Subtract; x: win.cpx; y: win.cpy; width: win.cpVis ? win.cpw : 0; height: win.cpVis ? Math.max(0, win.ay + win.ah - win.cpy) : 0 }
+        Region { intersection: Intersection.Subtract; x: win.sMaskX; y: win.sy; width: (scope.session || win.sVis) ? win.sMaskW : 0; height: (scope.session || win.sVis) ? win.sh : 0 }
+        Region { intersection: Intersection.Subtract; x: win.pcx; y: win.pcy; width: win.pVis ? win.pcw : 0; height: win.pVis ? win.pch : 0 }
+        Region { intersection: Intersection.Subtract; x: win.ux; y: win.uMaskY; width: (scope.utilities || win.uVis) ? Math.max(0, win.uw) : 0; height: (scope.utilities || win.uVis) ? win.uMaskH : 0 }
+        Region { intersection: Intersection.Subtract; x: win.sideMaskX(win.sbx); y: win.sby; width: win.sbVis ? win.sideMaskW(win.sbx, win.sbw) : 0; height: win.sbVis ? win.sbh : 0 }
+        Region { intersection: Intersection.Subtract; x: win.osdMaskX; y: win.osdY; width: win.osdVis ? win.osdMaskW : 0; height: win.osdVis ? win.osdH : 0 }
+        Region { intersection: Intersection.Subtract; x: win.tx; y: win.ty; width: win.th > 0 && !scope.hasFullscreen ? win.tw : 0; height: win.th }
+      }
+    }
+
+    // Hyprland hands the keyboard to a window on the workspace you switch to,
+    // and to *nothing at all* when that workspace is empty -- an OnDemand
+    // layer surface is not offered it back, so the panel that asked for the
+    // switch stops receiving keys. Taking the grab again puts the keyboard
+    // back on this window; the overview asks for that after every switch.
+    property bool focusPrimed: true
+    function primeFocus() {
+      focusPrimed = false
+      primeTimer.restart()
+      primeSettle.restart()
+    }
+    // The prime's switch from Exclusive to OnDemand clears the focus grab,
+    // which would close the popout it was opening; for a moment after a
+    // keyboard open, a cleared grab is taken again instead.
+    Timer {
+      id: primeSettle
+      interval: 400
+    }
+    Timer {
+      id: primeTimer
+      interval: 120
+      onTriggered: {
+        win.focusPrimed = true
+        Qt.callLater(() => scope.popout !== "" ? pop.forceActiveFocus() : scope.barFocus ? bar.takeKeys()
+          : scope.drawerKeys ? drawerKeyItem.forceActiveFocus() : null)
+      }
+    }
+
+    property bool regrabbing: false
+    function regrab() {
+      regrabTimer.restart()
+    }
+    Timer {
+      id: regrabTimer
+      interval: 50
+      onTriggered: {
+        win.regrabbing = true
+        grab.active = false
+        grab.active = Qt.binding(() => win.grabWanted)
+        win.regrabbing = false
+        if (scope.overview && overviewContent) overviewContent.forceActiveFocus()
+        else if (scope.barFocus && scope.popout === "") bar.takeKeys()
+      }
+    }
+    readonly property bool grabWanted: scope.barFocus || scope.launcher || scope.session || scope.settings || scope.overview || scope.sidebar || (scope.utilities && scope.utilShortcut) || (scope.dashboard && scope.dashShortcut) || scope.popoutSticky
+    HyprlandFocusGrab {
+      id: grab
+      windows: [win]
+      active: win.grabWanted
+      onCleared: {
+        if (win.regrabbing) return
+        if (scope.overview || primeSettle.running || wsSettle.running) {
+          regrabTimer.restart()
+        } else {
+          scope.closeAll()
+        }
+      }
+    }
+
+    // Holds the keyboard for the dashboard / sidebar / utilities cursor.
+    Item {
+      id: drawerKeyItem
+      Keys.onPressed: e => scope.drawerKey(e)
+    }
+
+    // ---------------------------------------------------- scrim
+    Rectangle {
+      anchors.fill: parent
+      color: Colours.m3scrim
+      opacity: 0.5 * Math.max(1 - win.nOff, 1 - win.oOff, Math.min(1, win.pDet))
+      visible: opacity > 0
+    }
+
+    // ------------------------------------------------------- jelly
+    // Caelestia's BlobRect deformation (ContentWindow.qml PanelBg
+    // deformAmount): each drawer stretches along its motion and wobbles once
+    // as it settles; the same matrix is applied to its content below.
+    BlobDeform { id: dashDeform; extra: dLiq.neck; amount: 0.1; cx: win.dx + win.dw / 2; cy: win.dy + win.dh / 2 }
+    BlobDeform { id: launchDeform; extra: lLiq.neck; amount: 0.1; cx: win.lx + win.lw / 2; cy: win.ly + win.lh / 2 }
+    BlobDeform { id: cpDeform; extra: cpLiq.neck; amount: 0.1; cx: win.cpx + win.cpw / 2; cy: win.cpy + win.cph / 2 }
+    BlobDeform { id: sessDeform; extra: sLiq.neck; amount: 0.2; cx: win.sx + win.sw / 2; cy: win.sy + win.sh / 2 }
+    BlobDeform {
+      id: popDeform
+      extra: pLiq.neck + pDetach.thread
+      amount: win.pDetachWanted ? 0.05 : scope.popout !== "" ? 0.15 : 0.1
+      cx: win.prx + win.prw / 2
+      cy: win.pry + win.prh / 2
+    }
+    BlobDeform { id: nDeform; extra: nLiq.neck + nDetach.thread; amount: 0.05; cx: win.nx + win.nw / 2; cy: win.ny + win.nh / 2 }
+    BlobDeform { id: oDeform; extra: oLiq.neck; amount: win.oAttached ? 0.1 : 0.05; cx: win.ox + win.ow / 2; cy: win.oy + win.oh / 2 }
+    BlobDeform { id: sbDeform; extra: sbLiq.neck; amount: 0.03; cx: win.sbx + win.sbw / 2; cy: win.sbRectY + win.sbRectH / 2 }
+    BlobDeform { id: utilDeform; extra: uLiq.neck; amount: win.sbVis ? 0.1 : 0.15; cx: win.ux + win.uw / 2; cy: win.uy + win.uh / 2 }
+    BlobDeform { id: osdDeform; extra: osdLiq.neck; amount: 0.25; cx: win.osdX + win.osdW / 2; cy: win.osdY + win.osdH / 2 }
+
+    // ------------------------------------------------------ liquid
+    // Settings › Motion (core/Liquid.qml), Omacale's own: each
+    // drawer's spring and the shape it gives the drawer's rect, Vitreus's
+    // necks and drops. Inactive, they are not read and every drawer is
+    // Caelestia's. The sidebar keeps its shape (its side is shared with
+    // utilities), and so do utilities while it holds them; the floating
+    // ones (Settings, the overview) already grow, so they don't drop.
+    readonly property string sideEdge: scope.mirror ? "left" : "right"
+    LiquidDrawer { id: dLiq; name: "dashboard"; open: win.dOpen; edge: "top"; canDrop: true }
+    LiquidDrawer { id: lLiq; name: "launcher"; open: win.lOpen; edge: "bottom"; canDrop: true }
+    LiquidDrawer { id: cpLiq; name: "launcher"; open: win.cpOpen; edge: "bottom"; canDrop: true }
+    LiquidDrawer { id: sLiq; name: "session"; open: win.sOpen; edge: win.sideEdge; canDrop: true }
+    LiquidDrawer { id: pLiq; name: "popouts"; open: win.pOpen; edge: scope.barPos; canDrop: !win.pDetachWanted }
+    LiquidDrawer { id: nLiq; name: "settings"; open: win.nOpen; edge: "none"; slow: scope.settings ? 1.3 : 1 }
+    LiquidDrawer { id: oLiq; name: "overview"; open: win.oOpen; edge: win.oAttached ? win.oPos : "none"; slow: scope.overview && !win.oAttached ? 1.3 : 1 }
+    LiquidDrawer { id: sbLiq; name: "sidebar"; open: win.sbOpen; edge: win.sideEdge }
+    LiquidDrawer { id: uLiq; name: "utilities"; open: win.uOpen; edge: scope.flipV ? "top" : "bottom" }
+    LiquidDrawer { id: osdLiq; name: "osd"; open: win.osdOpen; edge: win.sideEdge; canDrop: true }
+    // The neck break: the window info popout leaving the bar for the middle,
+    // and Settings leaving the bar (or the popout it was opened from).
+    LiquidDetach {
+      id: pDetach
+      active: pLiq.active
+      t: Math.max(0, Math.min(1, win.pDet))
+      edge: scope.barPos
+      ex: scope.barVert ? (scope.barPos === "left" ? win.ax : win.ax + win.aw) : win.pa + win.pwTarget / 2
+      ey: scope.barVert ? win.pa + win.phTarget / 2 : (scope.barPos === "top" ? win.ay : win.ay + win.ah)
+    }
+    LiquidDetach {
+      id: nDetach
+      active: nLiq.active
+      t: Math.max(0, Math.min(1, 1 - win.nOff))
+      edge: scope.barPos
+      readonly property var from: win.nFrom
+      ex: scope.barVert ? (scope.barPos === "left" ? win.ax : win.ax + win.aw) : from[0] + from[2] / 2
+      ey: scope.barVert ? from[1] + from[3] / 2 : (scope.barPos === "top" ? win.ay : win.ay + win.ah)
+    }
+    // The drawers' rects as drawn (r0..r9, see BlobSurface below).
+    readonly property var dRect: dVis ? dLiq.rect([dx, dy, dw, dh]) : null
+    readonly property var lRect: lVis ? lLiq.rect([lx, ly, lw, lh]) : null
+    readonly property var sRect: sVis ? sLiq.rect([sx, sy, sw, sh]) : null
+    readonly property var pRect: pVis && !pHandoff ? pLiq.rect([prx, pry, prw, prh]) : null
+    readonly property var nRect: nVis ? nLiq.rect([nx, ny, nw, nh]) : null
+    readonly property var uRect: !uVis ? null : sbVis ? [ux, uy, uw, uh] : uLiq.rect([ux, uy, uw, uh])
+    // The sidebar's overshoot as width, out from its wall (utilities follow
+    // it through uw).
+    readonly property real sbOver: sbLiq.active ? sbw * Math.max(0, -sbOff) : 0
+    readonly property var sbRect: sbVis ? [scope.mirror ? sbx : sbx - sbOver, sbRectY, sbw + sbOver, sbRectH] : null
+    readonly property var oRect: oVis ? oLiq.rect([ox, oy, ow, oh]) : null
+    readonly property var cpRect: cpVis ? cpLiq.rect([cpx, cpy, cpw, cph]) : null
+    readonly property var osdRect: osdVis ? osdLiq.rect([osdX, osdY, osdW, osdH]) : null
+
+    // What the glass's bevel bends (Glass.lens): the wallpaper and this
+    // screen's windows, rebuilt; live only while a drawer is open.
+    readonly property bool anyDrawer: !!(dRect || lRect || sRect || pRect || nRect || uRect || sbRect || oRect || cpRect || osdRect)
+    Loader {
+      id: glassBackdrop
+      anchors.fill: parent
+      active: Glass.lens
+      sourceComponent: GlassBackdrop {
+        screen: scope.screen
+        live: win.anyDrawer && !scope.hasFullscreen
+        frost: Glass.frostPx
+      }
+    }
+
+    // ---------------------------------------------------- background
+    Item {
+      anchors.fill: parent
+      // Caelestia draws the blob opaque and fades the whole layer (and so
+      // its shadow) by the surface's alpha. Glass is translucent in the
+      // shader, and draws its own shadow round the shape only (one under
+      // the glass would show through it).
+      opacity: Glass.enabled ? 1 : Colours.m3surface.a
+      // Only when there is a shadow to draw. The layer is a screen-sized
+      // texture that the frame shader renders into and MultiEffect then
+      // blurs; with shadows off that whole round trip produced the same
+      // pixels the shader can write straight to the window.
+      layer.enabled: scope.cfg.appearance.shadow && !Glass.enabled
+      layer.effect: MultiEffect {
+        shadowEnabled: true
+        blurMax: 15
+        shadowColor: Qt.alpha(Colours.m3shadow, 0.7 * Math.max(0, 1 - win.fs))
+      }
+
+      BlobSurface {
+        anchors.fill: parent
+        hole: Qt.rect(win.ax, win.ay, win.aw, win.ah)
+        frameRadius: Tk.borderRounding * (1 - win.fs)
+        color: Qt.alpha(Colours.m3surface, 1)
+        Behavior on color { CAnim {} }
+        glassA: Glass.a
+        glassB: Glass.b
+        glassC: glassBackdrop.item ? Glass.c : Qt.vector4d(0, Glass.c.y, Glass.c.z, Glass.c.w)
+        glassD: Glass.d
+        backdrop: glassBackdrop.item ? glassBackdrop.item.texture : noBackdrop
+        frosted: glassBackdrop.item ? glassBackdrop.item.frosted : noBackdrop
+        Image { id: noBackdrop; visible: false }
+        // Only bound while the light follows it, so the pointer moving
+        // doesn't redraw the frame otherwise.
+        pointer: Glass.pointer ? Qt.vector2d(interactions.mouseX, interactions.mouseY) : Qt.vector2d(0, 0)
+
+        // r0 dashboard, r1 launcher, r2 session, r3 popout, r4 settings,
+        // r5 utilities, r6 sidebar, r7 overview, r8 clipboard preview, r9 OSD.
+        rects: [win.dRect, win.lRect, win.sRect, win.pRect, win.nRect,
+                win.uRect, win.sbRect, win.oRect, win.cpRect, win.osdRect]
+        deforms: [dashDeform.vec, launchDeform.vec, sessDeform.vec, popDeform.vec, nDeform.vec,
+                  utilDeform.vec, sbDeform.vec, oDeform.vec, cpDeform.vec, osdDeform.vec]
+        // The corner the sidebar and utilities share flattens as the sidebar
+        // comes in (its left side; the right, with a right-hand bar; the
+        // utilities' bottom and the sidebar's top, with a bottom bar).
+        readonly property real jr: win.joinRound * Tk.rounding.extraLarge
+        // Liquid, a drawer is round as a drop at first and squares up as it
+        // grows (LiquidDrawer.corner; -1 when off).
+        readonly property real uRound: win.sbVis ? -1 : uLiq.corner(win.uRect, radius)
+        corners: [dLiq.corner(win.dRect, radius), lLiq.corner(win.lRect, radius), sLiq.corner(win.sRect, radius),
+          pLiq.corner(win.pRect, radius), nLiq.corner(win.nRect, radius),
+          uRound >= 0 ? uRound : scope.flipV ? [-1, -1, jr, -1] : scope.mirror ? [jr, -1, -1, -1] : [-1, -1, -1, jr],
+          scope.flipV ? [-1, -1, -1, jr] : scope.mirror ? [-1, jr, -1, -1] : [-1, -1, jr, -1],
+          oLiq.corner(win.oRect, radius), cpLiq.corner(win.cpRect, radius), osdLiq.corner(win.osdRect, radius)]
+        bumps: pDetach.showing ? pDetach.bumps : nDetach.bumps
+        // The clipboard preview is its own panel beside the launcher, as
+        // Caelestia PR #1298 draws it, not a bulge of it.
+        excluded: win.joinExcluded ? [[1, 8], [5, 6]] : [[1, 8]]
+      }
+    }
+
+    // ---------------------------------------------------- interactions
+    MouseArea {
+      id: interactions
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: win.fs > 0 ? Qt.NoButton : Qt.AllButtons
+      property point dragStart
+
+      // How far a point is from the bar's screen edge, and where it is along
+      // the bar: the two axes the bar's hit tests work in.
+      function barDepth(x, y) {
+        return scope.barPos === "left" ? x : scope.barPos === "right" ? win.width - x : scope.barPos === "top" ? y : win.height - y
+      }
+      function barAlong(x, y) { return scope.barVert ? y : x }
+      // A popout, and the bar between it and its edge.
+      function inPopout(x, y) {
+        const r = Tk.borderRounding
+        const inX = x >= win.px - r && x <= win.px + win.pw + r
+        const inY = y >= win.py - r && y <= win.py + win.ph + r
+        if (scope.barPos === "left") return x < win.px + win.pw + r && inY
+        if (scope.barPos === "right") return x > win.px - r && inY
+        if (scope.barPos === "top") return y < win.py + win.ph + r && inX
+        return y > win.py - r && inX
+      }
+      // Caelestia inBottomPanel(utilities, isCorner = true), measured from the
+      // panel area's bottom edge.
+      // The utilities' hover corner: the bottom of the panel area, or its top
+      // when a bottom bar has put them there.
+      function inBottomUtil(x, y) {
+        const inX = scope.mirror ? x <= win.ax + win.uw + Tk.borderRounding : x >= win.ux - Tk.borderRounding
+        if (!inX) return false
+        if (scope.utilities) {
+          if (scope.flipV) return y <= win.uy + win.uh + Tk.borderRounding
+          return y >= win.uy - Tk.borderRounding && y <= win.height
+        }
+        if (scope.flipV) return y <= win.ay + Math.max(Tk.border, 6)
+        return y >= win.height - Math.max(Tk.border, 6)
+      }
+      // The dashboard hovers from the panel area's top edge (below a bar on the
+      // top edge, whose own strip belongs to its popouts).
+      function inTopDash(x, y) {
+        const top = scope.barPos === "top" ? win.ay : 0
+        const inX = x >= win.dx - Tk.borderRounding && x <= win.dx + win.dw + Tk.borderRounding
+        if (!inX) return false
+        if (scope.dashboard) {
+          return y >= top && y <= win.ay + win.dh + Tk.borderRounding
+        }
+        return y >= top && y <= top + Math.max(Tk.border, 6)
+      }
+      // Caelestia inRightPanel(osdWrapper): on the OSD, or -- while it is
+      // away -- in the frame's border beside where it comes out.
+      function inOsd(x, y) {
+        const visibleW = win.osdW * (1 - win.osdOff)
+        const inY = y >= win.osdY - Tk.borderRounding && y <= win.osdY + win.osdH + Tk.borderRounding
+        if (scope.mirror) return x < Math.max(win.ax, win.osdEdge + visibleW) && inY
+        return x > Math.min(win.ax + win.aw, win.osdEdge - visibleW) && inY
+      }
+      // The right-hand drawers' side: is a press or drag at x on it.
+      function nearSideEdge(x) {
+        return scope.mirror ? x < win.ax + Tk.borderRounding : x > win.ax + win.aw - Tk.borderRounding
+      }
+      // A drag's distance toward the middle of the screen from the right-hand
+      // drawers' edge (away from it, with a right-hand bar).
+      function sideInward(dx) { return scope.mirror ? dx : -dx }
+
+      onPressed: e => {
+        dragStart = Qt.point(e.x, e.y)
+        // A click on the scrim (outside the settings panel) closes it.
+        if (scope.settings && !(e.x >= win.nx && e.x <= win.nx + win.nw && e.y >= win.ny && e.y <= win.ny + win.nh)) scope.settings = false
+        if (scope.overview && !(e.x >= win.ox && e.x <= win.ox + win.ow && e.y >= win.oy && e.y <= win.oy + win.oh)) scope.overview = false
+        if (scope.sidebar && (scope.mirror ? e.x > win.sbx + win.sbw : e.x < win.sbx)) scope.sidebar = false
+        if (scope.utilities && !scope.sidebar && ((scope.mirror ? e.x > win.ux + win.uw : e.x < win.ux) || (scope.flipV ? e.y > win.uy + win.uh : e.y < win.uy))) scope.utilities = false
+      }
+      Timer {
+        id: leaveDebounce
+        interval: 150
+        onTriggered: {
+          if (interactions.containsMouse) return
+          if (scope.osdHovered) { scope.osd = false; scope.osdHovered = false }
+          bar.hoverAt(-1, false)
+          if (!scope.dashShortcut) scope.dashboard = false
+          if (!scope.utilShortcut) scope.utilities = false
+          if (!scope.popoutSticky) scope.popout = ""
+          scope.barHover = false
+        }
+      }
+      onContainsMouseChanged: {
+        if (containsMouse) {
+          leaveDebounce.stop()
+        } else {
+          leaveDebounce.restart()
+        }
+      }
+      onWheel: e => { if (!scope.barOff && barDepth(e.x, e.y) < win.bw) bar.handleWheel(barAlong(e.x, e.y), e.angleDelta.y) }
+      onPositionChanged: e => {
+        if (win.fs > 0) return
+        // With Settings open the bar's groups (the chevron, the compact tray)
+        // still open under the pointer -- Settings › Taskbar is where you try
+        // them -- but nothing else reacts: no popouts over the panel, no
+        // drawers.
+        if (scope.settings) {
+          bar.hoverAt(barAlong(e.x, e.y), barDepth(e.x, e.y) < win.bw && win.barProg > 0.5)
+          return
+        }
+        const x = e.x, y = e.y, dx = x - dragStart.x, dy = y - dragStart.y
+
+        // Auto-hiding bar: reveal at the bar's edge, hide once well away.
+        if (!scope.cfg.bar.persistent && !scope.barOff) {
+          const depth = barDepth(x, y)
+          if (scope.cfg.bar.showOnHover && depth <= Math.max(Tk.border, 6)) scope.barHover = true
+          else if (depth > Tk.barWidth + Tk.borderRounding && !(scope.popout !== "" && inPopout(x, y))) scope.barHover = false
+          const drag = scope.barPos === "left" ? dx : scope.barPos === "right" ? -dx : scope.barPos === "top" ? dy : -dy
+          if (pressed && barDepth(dragStart.x, dragStart.y) <= Math.max(Tk.border, 6) && drag > 20) scope.barHover = true
+        }
+
+        // Session: drag in from the right-hand edge.
+        if (scope.cfg.session.enabled && pressed && nearSideEdge(dragStart.x) && Math.abs(y - (win.sy + win.sh / 2)) < win.sh / 2 + Tk.borderRounding) {
+          if (sideInward(dx) > scope.cfg.session.dragThreshold) scope.session = true
+          else if (sideInward(dx) < -scope.cfg.session.dragThreshold) scope.session = false
+        }
+        // Sidebar: drag in from the top of that edge, or drag back out to close
+        if ((!scope.cfg.sidebar || scope.cfg.sidebar.enabled) && pressed && !scope.sidebar && nearSideEdge(dragStart.x) && (scope.flipV ? y > win.sy + win.sh : y < win.sy) && sideInward(dx) > 30) {
+          scope.sidebar = true
+        } else if (pressed && scope.sidebar && (scope.mirror ? dragStart.x <= win.sbx + win.sbw : dragStart.x >= win.sbx) && sideInward(dx) < -40) {
+          scope.sidebar = false
+          if (scope.utilShortcut) scope.utilities = false
+        }
+        // Launcher: drag up from the bottom edge.
+        if (scope.cfg.launcher.enabled && pressed && dragStart.y > win.ay + win.ah - Tk.borderRounding && x >= win.lx - Tk.borderRounding && x <= win.lx + win.lw + Tk.borderRounding) {
+          if (dy < -scope.cfg.launcher.dragThreshold) scope.launcher = true
+          else if (dy > scope.cfg.launcher.dragThreshold) scope.launcher = false
+        }
+        // Dashboard: hover the top edge.
+        if (scope.cfg.dashboard.enabled) {
+          const showDash = scope.cfg.dashboard.showOnHover && inTopDash(x, y)
+          if (!scope.dashShortcut) scope.dashboard = showDash
+          // Caelestia hands a shortcut-opened dashboard to the pointer once it
+          // hovers it -- which also takes the keyboard away. Not mid-way
+          // through keyboard navigation: the keys would land in the window
+          // behind (a held key kept repeating there).
+          else if (showDash && !drawerNav.cursor) scope.dashShortcut = false
+        }
+
+        // OSD: hover the middle of the right-hand edge, while the sidebar is
+        // away (Caelestia Interactions.qml). Caelestia sets it on every move;
+        // only a change of hover is acted on here, so moving over the bar
+        // doesn't throw away the OSD a volume key has just shown.
+        if (scope.cfg.osd.enabled && win.sbOff >= 1) {
+          const showOsd = inOsd(x, y)
+          if (showOsd !== scope.osdHovered) {
+            scope.osdHovered = showOsd
+            scope.osd = showOsd
+          }
+        }
+
+        // Utilities: hover the bottom-right corner.
+        if (!scope.cfg.utilities || scope.cfg.utilities.enabled) {
+          const showUtil = inBottomUtil(x, y)
+          if (!scope.utilShortcut) scope.utilities = showUtil
+          else if (showUtil && !drawerNav.cursor) scope.utilShortcut = false
+        }
+
+        updatePointer(x, y)
+      }
+
+      // Bar popouts and the collapsible groups (compact tray, plugin
+      // overflow), for a pointer at window coordinates x, y.
+      function updatePointer(x, y) {
+        const onBar = barDepth(x, y) < win.bw && win.barProg > 0.5
+        bar.hoverAt(barAlong(x, y), onBar)
+
+        if (scope.popoutHeld) return
+        if (onBar) {
+          const p = bar.popoutAt(barAlong(x, y))
+          if (p) {
+            if (p.name === "traymenu") {
+              if (scope.popout !== "traymenu" || scope.trayItem !== p.item) { scope.trayItem = p.item; scope.popout = ""; scope.popout = "traymenu" }
+            } else scope.popout = p.name
+            scope.popoutCenter = p.center
+          } else if (scope.popout !== "traymenu") scope.popout = ""
+        } else if (!inPopout(x, y)) {
+          // Off the bar and out of the popout: the tray menu goes too, so a
+          // compact tray doesn't stay open behind it.
+          scope.popout = ""
+        }
+      }
+
+      // The pointer leaving the bar is invisible here: the window's input
+      // mask means no event arrives, and Qt keeps hover state (containsMouse
+      // never goes false). While a group is open -- and only then -- ask
+      // Hyprland where the cursor is; Quickshell has no cursor API.
+      Timer {
+        id: pointerPoll
+        interval: 350
+        repeat: true
+        running: bar.groupsExpanded
+        onTriggered: if (!cursorProc.running) cursorProc.running = true
+      }
+      Process {
+        id: cursorProc
+        command: ["hyprctl", "cursorpos"]
+        stdout: StdioCollector {
+          onStreamFinished: {
+            const p = String(text).split(",")
+            if (p.length < 2 || !scope.screen) return
+            const gx = Number(p[0]), gy = Number(p[1])
+            if (!isFinite(gx) || !isFinite(gy)) return
+            interactions.updatePointer(gx - scope.screen.x, gy - scope.screen.y)
+          }
+        }
+      }
+
+      BarContent {
+        id: bar
+        // Slides in from its edge as the frame's breadth on it grows.
+        x: scope.barPos === "left" ? win.bw - Tk.barWidth : scope.barPos === "right" ? win.width - win.bw : 0
+        y: scope.barPos === "top" ? win.bw - Tk.barWidth : scope.barPos === "bottom" ? win.height - win.bw : 0
+        width: scope.barVert ? Tk.barWidth : win.width
+        height: scope.barVert ? win.height : Tk.barWidth
+        vertical: scope.barVert
+        edge: scope.barPos
+        // Slid, never faded, with the frame's breadth; gone as soon as it
+        // starts to hide (Caelestia's content Loader is active only while
+        // the bar should be visible).
+        opacity: 1 - win.fs
+        visible: opacity > 0 && win.barShown && win.bw > Tk.border
+        screen: scope.screen
+        host: scope.host
+        scope: scope
+        keyMode: scope.barFocus
+      }
+
+      // ---- tooltip bubble for widgets
+      Rectangle {
+        id: tooltipBubble
+        visible: scope.host.tooltipShown && scope.host.tooltipText !== "" && scope.host.tooltipTarget !== null
+        // The target's centre, mapped: hosted widgets are scaled and may be
+        // turned, so its (0,0) plus half its height is not its middle.
+        readonly property point targetPt: {
+          var t = scope.host.tooltipTarget
+          if (!t) return Qt.point(0, 0)
+          try {
+            return t.mapToItem(win.contentItem, t.width / 2, t.height / 2)
+          } catch (e) {
+            return Qt.point(0, 0)
+          }
+        }
+        // Beside the widget, away from the bar's edge.
+        x: scope.barVert
+          ? (scope.barPos === "left" ? Tk.barWidth + Tk.spacing.small : win.width - Tk.barWidth - Tk.spacing.small - width)
+          : Math.max(Tk.padding.medium, Math.min(targetPt.x - width / 2, win.width - width - Tk.padding.medium))
+        y: scope.barVert
+          ? Math.max(Tk.padding.medium, Math.min(targetPt.y - height / 2, win.height - height - Tk.padding.medium))
+          : (scope.barPos === "top" ? Tk.barWidth + Tk.spacing.small : win.height - Tk.barWidth - Tk.spacing.small - height)
+        z: 999
+        implicitWidth: tipText.implicitWidth + Tk.padding.medium * 2
+        implicitHeight: tipText.implicitHeight + Tk.padding.small * 2
+        radius: Tk.rounding.small
+        color: Colours.m3surfaceContainerHigh
+        border.color: Colours.m3outlineVariant
+        border.width: 1
+        opacity: visible ? 1 : 0
+        Behavior on opacity { Anim { type: "effects" } }
+        MText {
+          id: tipText
+          anchors.centerIn: parent
+          text: scope.host.tooltipText
+          font.pointSize: Tk.body.small
+          color: Colours.m3onSurface
+        }
+      }
+
+      // ---- popout
+      Item {
+        x: win.pcx
+        y: win.pcy
+        width: win.pcw
+        height: win.pch
+        visible: win.pVis
+        clip: true
+        Item {
+          x: win.px - win.pcx
+          y: win.py - win.pcy
+          width: win.pw
+          height: win.ph
+          // Caelestia's popout Wrapper fades its content in and out (200ms)
+          // while the popout slides.
+          opacity: win.pHandoff ? 0 : (pLiq.active ? pLiq.contentOpacity : 1 - win.pOff) * win.pFade
+          transform: [
+            Matrix4x4 { matrix: popDeform.matrixAt(win.prx + win.prw / 2 - win.px, win.pry + win.prh / 2 - win.py) },
+            // Liquid's drop style: the content grows out of the bar with its rect.
+            Scale {
+              origin.x: scope.barPos === "left" ? 0 : scope.barPos === "right" ? win.pw : win.pw / 2
+              origin.y: scope.barPos === "top" ? 0 : scope.barPos === "bottom" ? win.ph : win.ph / 2
+              xScale: pLiq.contentScale[0]
+              yScale: pLiq.contentScale[1]
+            }
+          ]
+          PopoutContent {
+            id: pop
+            // Centred in the animating popout, as Caelestia's pages are, so
+            // a page switch grows and shrinks around the content.
+            x: Math.round((win.pw - width) / 2)
+            y: Math.round((win.ph - height) / 2)
+            width: implicitWidth
+            height: implicitHeight
+            host: scope.host
+            trayItem: scope.trayItem
+            screen: scope.screen
+            open: scope.popout !== ""
+            property string lastName: ""
+            name: scope.popout !== "" ? scope.popout : lastName
+            onNameChanged: if (scope.popout !== "") lastName = scope.popout
+            passwordSsid: scope.passwordSsid
+            onCloseRequested: scope.popout = ""
+            keyMode: scope.popoutKeys
+            onTabRequested: d => scope.tabPopout(d)
+            onSwitchRequested: (name, arg) => {
+              if (name === "wirelesspassword") scope.passwordSsid = arg
+              scope.popout = name
+            }
+          }
+        }
+      }
+
+      // ---- dashboard
+      Loader {
+        id: dashLoader
+        active: scope.dashboard || win.dVis
+        sourceComponent: Dashboard {
+          x: win.dx
+          y: win.dy
+          width: win.dw
+          height: win.dh
+          visible: win.dVis
+          opacity: dLiq.active ? dLiq.contentOpacity : 1 - win.dOff
+          transform: [
+            Matrix4x4 { matrix: dashDeform.matrixAt(win.dw / 2, win.dh / 2) },
+            Scale { origin.x: win.dw / 2; origin.y: 0; xScale: dLiq.contentScale[0]; yScale: dLiq.contentScale[1] }
+          ]
+          host: scope.host
+          active: scope.dashboard
+          tab: scope.dashTab
+          onTabChanged: scope.dashTab = tab
+          onFaceRequested: { scope.dashboard = false; facePicker.open() }
+        }
+      }
+
+      // ---- launcher
+      Loader {
+        id: launchLoader
+        active: scope.launcher || win.lVis
+        // A Loader is a focus scope: without `focus` on it, nothing inside can
+        // hold the keyboard, and a drawer created on open has no earlier focus
+        // to fall back on.
+        focus: scope.launcher
+        onLoaded: {
+          if (scope.launchPendingMode && item && typeof item.openMode === "function") {
+            item.openMode(scope.launchPendingMode)
+            scope.launchPendingMode = ""
+          }
+        }
+        sourceComponent: Launcher {
+          x: win.lx
+          y: win.ly
+          width: win.lw
+          height: win.lh
+          visible: win.lVis
+          opacity: lLiq.active ? lLiq.contentOpacity : 1 - win.lOff
+          transform: [
+            Matrix4x4 { matrix: launchDeform.matrixAt(win.lw / 2, win.lh / 2) },
+            Scale { origin.x: win.lw / 2; origin.y: win.lh; xScale: lLiq.contentScale[0]; yScale: lLiq.contentScale[1] }
+          ]
+          active: scope.launcher
+          screenWidth: win.width
+          sideMargin: scope.sidebar || scope.utilities ? (scope.sidebar ? win.sbw : Tk.sizes.utilitiesWidth) : 0
+          maxHeight: win.ah - (scope.dashboard ? win.dh : 0) + Tk.padding.extraLarge
+          onDismissed: scope.launcher = false
+          onOpenSettings: { scope.launcher = false; scope.settings = true }
+          onClipRowChanged: if (clipRow) win.cpRow = clipRow
+        }
+      }
+
+      // ---- clipboard preview (beside the launcher)
+      Loader {
+        id: cpLoader
+        active: win.cpVis
+        sourceComponent: ClipboardPreview {
+          x: win.cpx + Tk.padding.large
+          y: win.cpy + Tk.padding.large
+          width: win.cpw - win.cpPadH
+          height: win.cph - win.cpPadV
+          opacity: cpLiq.active ? cpLiq.contentOpacity : 1 - win.cpOff
+          transform: [
+            Matrix4x4 { matrix: cpDeform.matrixAt(win.cpw / 2 - Tk.padding.large, win.cph / 2 - Tk.padding.large) },
+            Scale { origin.x: win.cpw / 2 - Tk.padding.large; origin.y: win.cph - Tk.padding.large; xScale: cpLiq.contentScale[0]; yScale: cpLiq.contentScale[1] }
+          ]
+          row: win.cpRow
+          maxW: win.cpMaxW
+          maxH: win.cpMaxH
+          textW: win.cpTextW
+        }
+      }
+
+      // ---- session
+      // Clipped at the sidebar's edge while the sidebar is out, so the menu
+      // slides out from behind it (Caelestia Panels.qml sessionWrapper clip).
+      Item {
+        x: win.sClipX
+        y: 0
+        width: win.sClipW
+        height: win.height
+        clip: win.sbVis
+        Loader {
+          id: sessLoader
+          active: scope.session || win.sVis
+          focus: scope.session
+          sourceComponent: Session {
+            mirror: scope.mirror
+            x: win.sx - win.sClipX
+            y: win.sy
+            visible: win.sVis
+            opacity: sLiq.active ? sLiq.contentOpacity : 1 - win.sOff
+            transform: [
+              Matrix4x4 { matrix: sessDeform.matrixAt(win.sw / 2, win.sh / 2) },
+              Scale { origin.x: scope.mirror ? 0 : win.sw; origin.y: win.sh / 2; xScale: sLiq.contentScale[0]; yScale: sLiq.contentScale[1] }
+            ]
+            active: scope.session
+            onDismissed: scope.session = false
+          }
+        }
+      }
+
+      // ---- sidebar
+      Loader {
+        id: sidebarLoader
+        active: scope.sidebar || win.sbVis
+        sourceComponent: Sidebar {
+          x: win.sbx
+          y: win.sby
+          width: win.sbw
+          height: win.sbh
+          visible: win.sbVis
+          opacity: sbLiq.active ? sbLiq.contentOpacity : 1 - win.sbOff
+          transform: Matrix4x4 { matrix: sbDeform.matrixAt(win.sbw / 2, win.sbRectY + win.sbRectH / 2 - win.sby) }
+          host: screenScope.host
+          scope: screenScope
+          active: screenScope.sidebar
+        }
+      }
+
+      // ---- utilities
+      Loader {
+        id: utilLoader
+        active: scope.utilities || scope.sidebar || win.uVis
+        sourceComponent: Utilities {
+          x: win.ux
+          y: win.uy
+          width: win.uw
+          visible: win.uVis
+          opacity: uLiq.active ? uLiq.contentOpacity : 1 - win.uOff
+          transform: Matrix4x4 { matrix: utilDeform.matrixAt(win.uw / 2, win.uh / 2) }
+          hStretch: utilDeform.m00
+          host: screenScope.host
+          scope: screenScope
+          active: screenScope.utilities || screenScope.sidebar
+        }
+      }
+
+      // ---- OSD
+      // Clipped at the edge it comes out of while the session menu or the
+      // sidebar is out (Caelestia Panels.qml osdWrapper clip).
+      Item {
+        x: scope.mirror ? win.osdEdge : 0
+        y: 0
+        width: scope.mirror ? win.width - win.osdEdge : win.osdEdge
+        height: win.height
+        clip: win.sbVis || win.sVis
+        Loader {
+          id: osdLoader
+          active: scope.osd || win.osdVis
+          sourceComponent: Osd {
+            x: win.osdX - (scope.mirror ? win.osdEdge : 0)
+            y: win.osdY
+            visible: win.osdVis
+            opacity: osdLiq.active ? osdLiq.contentOpacity : 1 - win.osdOff
+            transform: [
+              Matrix4x4 { matrix: osdDeform.matrixAt(win.osdW / 2, win.osdH / 2) },
+              Scale { origin.x: scope.mirror ? 0 : win.osdW; origin.y: win.osdH / 2; xScale: osdLiq.contentScale[0]; yScale: osdLiq.contentScale[1] }
+            ]
+            mirror: scope.mirror
+            sessionOpen: scope.session
+          }
+        }
+      }
+
+      // ---- toasts (Caelestia utilities/toasts)
+      Toasts {
+        id: toastsView
+        x: win.tx
+        y: win.ty
+        width: implicitWidth
+        height: implicitHeight
+        visible: !scope.hasFullscreen
+      }
+
+      // ---- overview
+      // Clipped like Settings, to its rect and the panel area: it grows out
+      // of its centre or slides out of its frame edge, the grid animates to
+      // its own size, and a row that has just appeared stays hidden until
+      // the panel holds it.
+      Item {
+        id: oClip
+        x: Math.max(win.ax, win.ox)
+        y: Math.max(win.ay, win.oy)
+        width: Math.max(0, Math.min(win.ax + win.aw, win.ox + win.ow) - x)
+        height: Math.max(0, Math.min(win.ay + win.ah, win.oy + win.oh) - y)
+        visible: win.oVis
+        clip: true
+        Loader {
+          id: overviewLoader
+          focus: scope.overview
+          // Unsized, so the drawer keeps its own size; centred on its rect.
+          anchors.centerIn: parent
+          active: scope.overview || win.oVis
+          sourceComponent: Overview {
+            width: implicitWidth
+            height: implicitHeight
+            opacity: win.oOpacity
+            transform: Matrix4x4 { matrix: oDeform.matrixAt(width / 2, height / 2) }
+            active: scope.overview
+            focus: scope.overview
+            screen: scope.screen
+            onDismissed: scope.overview = false
+            onRefocus: win.regrab()
+          }
+        }
+      }
+
+      // ---- settings
+      // Clipped to its rect and to the panel area, as Caelestia's ClipWrapper
+      // inside Panels: it comes out from behind the bar.
+      Item {
+        id: nClip
+        x: Math.max(win.ax, win.nx)
+        y: Math.max(win.ay, win.ny)
+        width: Math.max(0, Math.min(win.ax + win.aw, win.nx + win.nw) - x)
+        height: Math.max(0, Math.min(win.ay + win.ah, win.ny + win.nh) - y)
+        visible: win.nVis
+        clip: true
+        Loader {
+          id: nexusLoader
+          focus: scope.settings
+          // Unsized, so the drawer keeps its own size; centred on its rect.
+          x: Math.round(win.nx + (win.nw - width) / 2) - nClip.x
+          y: Math.round(win.ny + (win.nh - height) / 2) - nClip.y
+          active: scope.settings || win.nVis
+          sourceComponent: Settings {
+            width: implicitWidth
+            height: implicitHeight
+            opacity: win.nFade
+            transform: Matrix4x4 { matrix: nDeform.matrixAt(width / 2, height / 2) }
+            active: scope.settings
+            screenWidth: scope.screen.width
+            screenHeight: scope.screen.height
+            version: scope.host.version
+            onCloseRequested: scope.settings = false
+            onPopOutRequested: { scope.settings = false; scope.settingsWindow = true }
+            onFileRequested: (title, filters, pick) => scope.requestFile(title, filters, pick, true)
+            onPickerRequested: kind => scope.openPicker(kind, true)
+            keyHook: e => screenScope.drawerKey(e)
+            pageId: scope.nexusPage
+            stack: scope.nexusStack
+            onPageIdChanged: scope.nexusPage = pageId
+            onStackChanged: scope.nexusStack = stack
+          }
+        }
+      }
+    }
+  }
+}

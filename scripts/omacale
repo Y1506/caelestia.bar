@@ -1,0 +1,1030 @@
+#!/usr/bin/env bash
+# omacale — installer / uninstaller for the Omacale Omarchy shell.
+#
+# Design rule: install records exactly what it is about to change, changes
+# only that, and uninstall reverts only that. Omacale touches:
+#
+#   1. ~/.config/omarchy/plugins/omacale.bar/   (its own plugin directory)
+#   2. `bar.id` in ~/.config/omarchy/shell.json (the one switch that selects
+#                                                a full bar plugin)
+#   3. ~/.config/omacale/                       (its settings, created on first change)
+#   4. ~/.local/state/omacale/                  (its own state + snapshots)
+#   5. ~/.config/omarchy/plugins/<user>.notifications/ and the plugin keys in
+#      shell.json that go with it -- only when you accept the notification
+#      popups, and only through `omarchy plugin clone` / `remove`
+#      (see scripts/notif-popups)
+#   6. ~/.config/omarchy/plugins/<user>.lock/ and the plugin keys in
+#      shell.json that go with it -- only when you accept the lock screen,
+#      and only through `omarchy plugin clone` / `remove`
+#      (see scripts/lock-screen)
+#   7. ~/.config/omarchy/plugins/<user>.osd/ and the plugin keys in
+#      shell.json that go with it -- only when you accept the volume and
+#      brightness OSD, and only through `omarchy plugin clone` / `remove`
+#      (see scripts/osd-handover)
+#   8. the Material Symbols icon font package, only when it is missing, and
+#      only through `omarchy pkg add` (dropped again on uninstall)
+#   (older versions also wrote a marked block to
+#   ~/.config/omarchy/extensions/omarchy-menu.jsonc; nothing writes it now,
+#   and both the plugin and uninstall remove a leftover one)
+#
+# It never edits ~/.config/hypr, themes, Omarchy's own files, or anything
+# else under /usr. Everything it needs to undo is snapshotted before the first write.
+set -Eeuo pipefail
+
+PLUGIN_ID="omacale.bar"
+VERSION="1.0.0"
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd -- "$script_dir/.." && pwd)"
+# The repository root is the plugin (manifest.json sits there, as the Omarchy
+# plugin marketplace and `omarchy plugin add` expect).
+src_plugin="$repo_dir"
+
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+omarchy_cfg="$config_home/omarchy"
+plugins_dir="$omarchy_cfg/plugins"
+shell_json="$omarchy_cfg/shell.json"
+dest_plugin="$plugins_dir/$PLUGIN_ID"
+settings_dir="$config_home/omacale"
+state_dir="${OMACALE_STATE_DIR:-$state_home/omacale}"
+state_file="$state_dir/state.json"
+snap_dir="$state_dir/pre-install"
+
+# OMACALE_OFFLINE=1 skips every call into the running Omarchy shell and
+# compositor. Used for sandboxed tests of the file logic.
+offline="${OMACALE_OFFLINE:-0}"
+
+dry_run=0
+assume_yes=0
+dev_link=0
+keep_state=0
+keep_settings=0
+no_restart=0
+cava_choice=""        # "", yes, no
+notif_choice=""       # "", yes, no
+lock_choice=""        # "", yes, no
+osd_choice=""         # "", yes, no
+bind_mode="print"
+cmd=""
+
+# ------------------------------------------------------------------ output
+
+if [[ -t 1 ]]; then b=$'\e[1m'; d=$'\e[2m'; g=$'\e[32m'; y=$'\e[33m'; r=$'\e[31m'; z=$'\e[0m'; else b=; d=; g=; y=; r=; z=; fi
+say()  { printf '%s\n' "$*"; }
+step() { printf '%s==>%s %s\n' "$b" "$z" "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$g" "$z" "$*"; }
+warn() { printf '  %s!%s %s\n' "$y" "$z" "$*" >&2; }
+fail() { printf '%somacale:%s %s\n' "$r" "$z" "$*" >&2; exit 1; }
+act()  { # act "description" cmd...   (respects --dry-run)
+  local desc="$1"; shift
+  if (( dry_run )); then printf '  %s[dry-run]%s %s\n' "$d" "$z" "$desc"; else "$@"; fi
+}
+
+usage() {
+  cat <<EOF
+${b}omacale $VERSION${z} — a Caelestia-style shell for Omarchy
+
+Usage: omacale <command> [options]
+
+Commands:
+  install      Install the plugin and switch the bar to it
+  uninstall    Remove the plugin and restore the exact pre-install state
+  status       Show what is installed and what would be restored
+  doctor       Check that Omacale and Omarchy are healthy
+  settings     Open the Omacale settings panel
+  binds        Print Omarchy-style keybindings to paste into bindings.lua
+                 --copy   copy them to the clipboard
+                 --try    bind them for this Hyprland session only
+                 --untry  remove the session-only binds again
+
+Options:
+  --dry-run    Show what would change; change nothing
+  --yes, -y    Do not ask for confirmation
+  --dev        (install) symlink the plugin from this checkout for live editing
+  --keep-state (uninstall) keep ~/.local/state/omacale afterwards
+  --keep-settings (uninstall) keep ~/.config/omacale (your Omacale settings)
+  --no-restart (install) do not restart the Omarchy shell afterwards
+  --with-cava  (install) also install cava for the media visualiser
+  --no-cava    (install) skip the cava question
+  --notif-popups    (install) draw notification popups as Caelestia toasts
+  --no-notif-popups (install) leave Omarchy's own toasts alone
+  --lock-screen     (install) draw the lock screen as Caelestia's (off unless asked)
+  --no-lock-screen  (install) leave Omarchy's own lock screen alone
+  --osd             (install) draw Omarchy's OSD as Caelestia's
+  --no-osd          (install) leave Omarchy's own OSD alone
+  --help, -h   Show this help
+
+Omacale changes only: its plugin directory, \`bar.id\` in shell.json, its
+settings directory, and its own state directory -- plus the Material Symbols
+icon font package when it is missing (removed again on uninstall). Nothing
+else under ~/.config/hypr or /usr is touched.
+EOF
+}
+
+# ------------------------------------------------------------------ helpers
+
+need() { command -v "$1" >/dev/null 2>&1 || fail "'$1' is required but not installed"; }
+
+# Every icon in the bar and the drawers is a Material Symbols glyph. Asked of
+# fontconfig, not pacman: the AUR -git build provides the same family.
+FONT_PKG="ttf-material-symbols-variable"
+font_present() { fc-list : family 2>/dev/null | grep -qi 'Material Symbols Rounded'; }
+
+sha() { [[ -e $1 ]] && sha256sum -- "$1" | cut -d' ' -f1 || echo "absent"; }
+
+confirm() {
+  (( assume_yes || dry_run )) && return 0
+  [[ -t 0 ]] || fail "confirmation needs a terminal; rerun with --yes"
+  local reply; read -r -p "$1 [y/N] " reply
+  [[ $reply =~ ^[yY]([eE][sS])?$ ]] || { say "Cancelled."; exit 0; }
+}
+
+# Atomic write of stdin to $1, same directory so rename is atomic.
+write_atomic() {
+  local target="$1" tmp
+  tmp="$(mktemp "${target}.omacale.XXXXXX")"
+  cat >"$tmp"
+  [[ -e $target ]] && chmod --reference="$target" "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$target"
+}
+
+# Copy plugin source $1 (the repo root) minus its git metadata to $2, which
+# must not exist yet.
+copy_plugin() {
+  mkdir -p -- "$2" && tar -C "$1" --exclude=./.git -cf - . | tar -C "$2" --no-same-owner -xf -
+}
+export -f copy_plugin
+
+shell_running() { (( ! offline )) && omarchy-shell shell ping 2>/dev/null | grep -q ok; }
+
+shell_call() { (( offline )) && return 0; omarchy-shell -q "$@" >/dev/null 2>&1 || true; }
+
+# Poll until $1 (a shell command string) succeeds or ~$2 seconds pass.
+wait_for() {
+  local tries=$(( $2 * 5 ))
+  while (( tries-- > 0 )); do eval "$1" >/dev/null 2>&1 && return 0; sleep 0.2; done
+  return 1
+}
+
+plugin_listed() { omarchy plugin list --json 2>/dev/null | jq -e --arg id "$PLUGIN_ID" 'any(.[]; .id == $id)' >/dev/null; }
+
+# The lock-screen handover lives in the plugin (Settings runs it too), so it
+# is read from the installed copy when there is one and from this checkout
+# otherwise -- the same script either way.
+lock_script() {
+  local script="$src_plugin/scripts/lock-screen"
+  [[ -x $dest_plugin/scripts/lock-screen ]] && script="$dest_plugin/scripts/lock-screen"
+  python3 "$script" "$@"
+}
+lock_handover_on() { lock_script status 2>/dev/null | grep -q "^view:      omacale"; }
+
+# Same for the notification handover: in the plugin, so the running shell can
+# re-sync its clone after an Omarchy update.
+notif_script() {
+  local script="$src_plugin/scripts/notif-popups"
+  [[ -x $dest_plugin/scripts/notif-popups ]] && script="$dest_plugin/scripts/notif-popups"
+  python3 "$script" "$@"
+}
+
+# And the OSD handover, for the same reason.
+# Omacale's block in Omarchy's user shell.toml (Settings › Wallpaper & style ›
+# "Colour Omarchy's menus too", services/OmarchySurfaces.qml).
+shell_toml() { PYTHONDONTWRITEBYTECODE=1 python3 "$src_plugin/scripts/shell-toml" "$@"; }
+
+osd_script() {
+  local script="$src_plugin/scripts/osd-handover"
+  [[ -x $dest_plugin/scripts/osd-handover ]] && script="$dest_plugin/scripts/osd-handover"
+  python3 "$script" "$@"
+}
+
+# Turning the handover on without turning the setting on would install it and
+# still draw Omarchy's view, so the two go together. An install also clears
+# the watchdog's fallback mark, as installing from Settings does; left set, it
+# keeps the watchdog off the new clone for good.
+set_lock_setting() {
+  local on="$1" file="$settings_dir/settings.json"
+  mkdir -p -- "$settings_dir"
+  if [[ -f $file ]]; then
+    jq --argjson on "$on" '.lock = ((.lock // {}) + { enabled: $on } + (if $on then { autoFellBack: false } else {} end))' "$file" | write_atomic "$file"
+  else
+    jq -n --argjson on "$on" '{ lock: { enabled: $on } }' | write_atomic "$file"
+  fi
+}
+
+# The watchdog's "handed back" mark, cleared when a handover is reinstalled.
+clear_fell_back() {
+  local key="$1" file="$settings_dir/settings.json"
+  [[ -f $file ]] || return 0
+  jq --arg k "$key" 'if has($k) then .[$k].autoFellBack = false else . end' "$file" | write_atomic "$file"
+}
+
+bar_layer_present() { hyprctl layers -j 2>/dev/null | grep -q '"namespace": *"omacale"'; }
+
+json_ok() { jq -e . "$1" >/dev/null 2>&1; }
+
+# Canonical form for semantic comparison of two JSON files.
+canon() { jq -S -c . "$1" 2>/dev/null || echo "invalid"; }
+
+# jq filter that strips everything Omacale owns from a shell.json document and
+# puts `bar.id` back to the recorded value. $prev is the pre-install bar.id
+# (null when it was unset); $pre is the pre-install document, used only to
+# decide whether an emptied array key existed before.
+read -r -d '' RESTORE_FILTER <<'JQ' || true
+def owned: ((if type == "object" then (.id // "") else tostring end) | startswith("omacale."));
+def drop($k): if has($k) and (.[$k] | type == "array")
+  then .[$k] |= map(select(owned | not))
+       | (if (.[$k] | length) == 0 and (($pre | has($k)) | not) then del(.[$k]) else . end)
+  else . end;
+(if ((.bar // {}) | .id // "") == $id
+   then (if $prev == null then del(.bar.id) else .bar.id = $prev end)
+   else . end)
+| (if (.bar? // null) != null and (.bar | type == "object") and (.bar | length) == 0
+      and (($pre.bar // null) == null) then del(.bar) else . end)
+| drop("plugins") | drop("disabledPlugins") | drop("cloneSourceRestores")
+JQ
+
+# ------------------------------------------------------------------ status
+
+installed_state() { [[ -f $state_file ]] && json_ok "$state_file"; }
+
+cmd_status() {
+  need jq
+  step "Omacale $VERSION"
+  if installed_state; then
+    ok "installed $(jq -r '.installedAt' "$state_file") ($(jq -r 'if .devLink then "dev symlink" else "copied" end' "$state_file"))"
+  else
+    say "  not installed (no state at $state_dir)"
+  fi
+  [[ -e $dest_plugin || -L $dest_plugin ]] && say "  plugin dir : $dest_plugin$([[ -L $dest_plugin ]] && echo ' (symlink)')" || say "  plugin dir : absent"
+  local cur="unset"
+  [[ -f $shell_json ]] && cur="$(jq -r '.bar.id // "unset (built-in omarchy.bar)"' "$shell_json" 2>/dev/null || echo unreadable)"
+  say "  bar.id     : $cur"
+  if (( ! offline )); then
+    local daemon
+    daemon="$(notif_script status 2>/dev/null | sed -n 's/^daemon:    //p')"
+    if [[ $daemon == "gated, Omacale draws"* ]]; then
+      say "  popups     : drawn by Omacale$(installed_state && [[ "$(jq -r '.installedNotifClone // false' "$state_file")" == true ]] && echo " (put back on uninstall)")"
+    elif [[ $daemon == gated* ]]; then
+      say "  popups     : drawn by Omarchy's own window (Omacale isn't claiming them: bar not loaded, or Show popups off)"
+    else
+      say "  popups     : drawn by Omarchy's own daemon"
+    fi
+    if osd_script status 2>/dev/null | grep -q "^patched:   yes"; then
+      say "  osd        : drawn by Omacale$(installed_state && [[ "$(jq -r '.installedOsdClone // false' "$state_file")" == true ]] && echo " (put back on uninstall)")"
+    else
+      say "  osd        : drawn by Omarchy's own OSD"
+    fi
+    if lock_handover_on; then
+      say "  lock       : drawn by Omacale$(installed_state && [[ "$(jq -r '.installedLockClone // false' "$state_file")" == true ]] && echo " (given back on uninstall)")"
+    else
+      say "  lock       : drawn by Omarchy's own lock screen"
+    fi
+  fi
+  if installed_state; then
+    say "  on uninstall → bar.id : $(jq -r 'if .pre.barId == null then "unset (built-in omarchy.bar)" else .pre.barId end' "$state_file")"
+    say "  pre-install shell.json : $(jq -r 'if .pre.shellJsonExisted then "snapshot kept (" + .pre.shellJsonSha + ")" else "did not exist" end' "$state_file")"
+  fi
+}
+
+# ------------------------------------------------------------------ doctor
+
+cmd_doctor() {
+  need jq
+  local bad=0
+  chk() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else warn "$1"; bad=1; fi; }
+  step "Environment"
+  chk "quickshell available" "command -v quickshell"
+  chk "omarchy CLI available" "command -v omarchy"
+  chk "Material Symbols Rounded font installed" "fc-list : family | grep -i 'Material Symbols Rounded' >/dev/null"
+  chk "curl and jq available (weather, lyrics)" "command -v curl && command -v jq"
+  if command -v cava >/dev/null 2>&1; then ok "cava installed (music visualiser)"; else say "  - cava not installed (optional: music visualiser)"; fi
+  if (( ! offline )); then
+    chk "Omarchy shell is running" "shell_running"
+  fi
+  step "Omacale"
+  chk "source plugin has a valid manifest" "jq -e '.id == \"$PLUGIN_ID\" and (.kinds | index(\"bar\"))' '$src_plugin/manifest.json'"
+  if installed_state; then
+    chk "state file is valid" "json_ok '$state_file'"
+    chk "plugin directory present" "[[ -e '$dest_plugin' ]]"
+    chk "pre-install snapshot present" "[[ ! -f '$state_file' ]] || jq -e '.pre.shellJsonExisted | not' '$state_file' || [[ -f '$snap_dir/shell.json' ]]"
+    chk "shell.json is valid JSON" "json_ok '$shell_json'"
+    if (( ! offline )); then
+      chk "plugin is discovered by the shell" "plugin_listed"
+      chk "bar layer is mapped" "bar_layer_present"
+      # A colour block left in Omarchy's shell.toml with the option off.
+      chk "no stray colour block in ~/.config/omarchy/shell.toml" \
+        "[[ \"\$(shell_toml status)\" == absent ]] || [[ \"\$(jq -r '.appearance.omarchySurfaces // false' '$settings_dir/settings.json' 2>/dev/null)\" == true ]]"
+      if [[ "$(jq -r '.installedNotifClone // false' "$state_file")" == true ]]; then
+        chk "notification daemon is Omacale's gated clone" \
+          "notif_script status | grep -q '^daemon:    gated'"
+        # The same checks the shell's watchdog runs (services/Handover.qml).
+        chk "notification clone runs the current Omarchy daemon" \
+          "notif_script status | grep -q '^stale:     no'"
+        chk "notification daemon answers (health)" "notif_script health"
+      fi
+      if [[ "$(jq -r '.installedOsdClone // false' "$state_file")" == true ]]; then
+        chk "OSD clone runs the current Omarchy OSD" \
+          "osd_script status | grep -q '^stale:     no'"
+        chk "OSD answers, patched (health)" "osd_script health"
+      fi
+      if [[ "$(jq -r '.installedLockClone // false' "$state_file")" == true ]]; then
+        chk "lock screen still handed over (Omacale draws it)" "lock_handover_on"
+        # The clone carries a copy of Omarchy's lock service; an `omarchy
+        # update` that changes it wants a reinstall to pick the new one up.
+        chk "lock clone runs the current Omarchy lock service" \
+          "lock_script status | grep -q '^stale:     no'"
+        chk "lock service answers, with PAM (health)" "lock_script health"
+      fi
+    fi
+  else
+    say "  not installed"
+  fi
+  exit $bad
+}
+
+# ------------------------------------------------------------------ install
+
+rollback_install() {
+  # Best-effort undo of a failed install, from the snapshot we just took.
+  warn "install failed — rolling back"
+  restore_shell_json || warn "could not restore shell.json automatically; snapshot is in $snap_dir"
+  remove_plugin_dir || true
+  restore_preexisting_plugin || true
+  shell_call shell rescanPlugins
+  rm -rf -- "$state_dir"     # a failed install leaves no trace
+}
+
+restore_shell_json() {
+  # Undo our change to shell.json. Preserves any edits the user made after
+  # install; only Omacale-owned keys are reverted.
+  local pre_existed prev
+  pre_existed="$(jq -r '.pre.shellJsonExisted' "$state_file")"
+  prev="$(jq -c '.pre.barId' "$state_file")"
+
+  if [[ $pre_existed == true ]]; then
+    local pre_doc="$snap_dir/shell.json"
+    [[ -f $pre_doc ]] || { warn "pre-install snapshot missing: $pre_doc"; return 1; }
+    if [[ -f $shell_json ]]; then
+      local tmp; tmp="$(mktemp)"
+      jq --arg id "$PLUGIN_ID" --argjson prev "$prev" \
+         --argjson pre "$(cat "$pre_doc")" "$RESTORE_FILTER" "$shell_json" >"$tmp" \
+         || { rm -f "$tmp"; return 1; }
+      if [[ "$(jq -S -c . "$tmp")" == "$(canon "$pre_doc")" ]]; then
+        # Semantically identical to the original → put the original bytes back.
+        cp --preserve=mode -- "$pre_doc" "$shell_json.omacale.tmp" && mv -f -- "$shell_json.omacale.tmp" "$shell_json"
+        ok "shell.json restored byte-for-byte from the pre-install snapshot"
+        rm -f "$tmp"
+      else
+        write_atomic "$shell_json" <"$tmp"; rm -f "$tmp"
+        ok "shell.json: Omacale entries removed, your later edits kept"
+      fi
+    else
+      cp --preserve=mode -- "$pre_doc" "$shell_json"
+      ok "shell.json recreated from the pre-install snapshot"
+    fi
+  else
+    # No shell.json existed before. The shell may have written one since.
+    if [[ -f $shell_json ]]; then
+      local tmp defaults; tmp="$(mktemp)"
+      defaults="${OMARCHY_PATH:-/usr/share/omarchy}/config/omarchy/shell.json"
+      jq --arg id "$PLUGIN_ID" --argjson prev null --argjson pre '{}' "$RESTORE_FILTER" "$shell_json" >"$tmp" \
+        || { rm -f "$tmp"; return 1; }
+      # Empty, version-only, or identical-to-defaults all mean "nothing of the
+      # user's is in here" — the file did not exist before, so it should not now.
+      if [[ "$(jq -S -c . "$tmp")" == '{"version":1}' || "$(jq -S -c . "$tmp")" == '{}' \
+            || ( -f $defaults && "$(jq -S -c . "$tmp")" == "$(canon "$defaults")" ) ]]; then
+        rm -f "$shell_json" "$tmp"
+        ok "shell.json removed (it did not exist before install; defaults apply again)"
+      else
+        write_atomic "$shell_json" <"$tmp"; rm -f "$tmp"
+        ok "shell.json: Omacale entries removed (file kept: it now holds other settings)"
+      fi
+    fi
+  fi
+}
+
+remove_plugin_dir() {
+  if [[ -L $dest_plugin ]]; then
+    rm -f -- "$dest_plugin"; ok "removed plugin symlink"
+  elif [[ -d $dest_plugin ]]; then
+    # Only ever delete a directory that really is ours.
+    if [[ "$(jq -r '.id // empty' "$dest_plugin/manifest.json" 2>/dev/null)" == "$PLUGIN_ID" ]]; then
+      rm -rf -- "$dest_plugin"; ok "removed $dest_plugin"
+    else
+      warn "$dest_plugin does not look like Omacale's plugin; left untouched"
+    fi
+  fi
+}
+
+restore_preexisting_plugin() {
+  # If the user had their own plugin dir with this id before install, put it back.
+  if [[ -d $snap_dir/plugin ]] && installed_state && [[ "$(jq -r '.pre.pluginDirExisted' "$state_file")" == true ]]; then
+    mv -- "$snap_dir/plugin" "$dest_plugin"
+    ok "restored the plugin directory that existed before install"
+  fi
+}
+
+# Every icon is a Material Symbols glyph, so a missing font draws them as
+# their names. Install and upgrade both check it: the font may have been
+# removed since the first install. Before the restart at the end, which is
+# what makes a freshly installed font visible to QML. Not fatal -- without it
+# the bar still works. Records installedFont only for a font we installed.
+font_installed_by_us=false
+icon_font_step() {
+  step "Icon font"
+  if font_present; then
+    ok "Material Symbols Rounded already installed"
+  elif (( dry_run )); then
+    say "  ${d}[dry-run]${z} omarchy pkg add $FONT_PKG"
+  elif (( offline )); then
+    say "  ${d}skipped (offline)${z}"
+  elif omarchy pkg add "$FONT_PKG" && font_present; then
+    font_installed_by_us=true; ok "$FONT_PKG installed"
+  else
+    warn "could not install $FONT_PKG; icons will show as text until you run: omarchy pkg add $FONT_PKG"
+  fi
+  if (( ! dry_run )); then
+    jq --argjson f "$font_installed_by_us" '.installedFont = ((.installedFont // false) or $f)' "$state_file" | write_atomic "$state_file"
+  fi
+}
+
+cmd_install() {
+  need jq; need cp; need sha256sum
+  [[ ${EUID:-$(id -u)} -ne 0 ]] || fail "run as your normal user, not root"
+  [[ -f $src_plugin/manifest.json ]] || fail "plugin source not found at $src_plugin"
+  jq -e --arg id "$PLUGIN_ID" '.id == $id' "$src_plugin/manifest.json" >/dev/null || fail "manifest id mismatch"
+  if (( ! offline )); then
+    need omarchy; need omarchy-shell
+    shell_running || fail "the Omarchy shell is not running; start it first (omarchy restart shell)"
+  fi
+  if installed_state; then cmd_upgrade; return; fi
+  if [[ -f $shell_json ]]; then json_ok "$shell_json" || fail "$shell_json is not valid JSON; refusing to touch it"; fi
+
+  step "Omacale $VERSION — install"
+  say "  plugin     : $src_plugin → $dest_plugin$( ((dev_link)) && echo ' (symlink)')"
+  say "  shell.json : set bar.id = $PLUGIN_ID  (current: $([[ -f $shell_json ]] && jq -r '.bar.id // "unset"' "$shell_json" || echo 'no file'))"
+  say "  snapshots  : $snap_dir"
+  font_present || say "  icon font  : install $FONT_PKG (needed for the icons; removed on uninstall)"
+  say "  untouched  : ~/.config/hypr, themes, /usr — nothing else is modified"
+  confirm "Continue?"
+
+  local pre_existed=false pre_sha="absent" prev_bar="null" plugin_existed=false settings_existed=false
+  [[ -e $settings_dir ]] && settings_existed=true
+  [[ -f $shell_json ]] && { pre_existed=true; pre_sha="$(sha "$shell_json")"; prev_bar="$(jq -c '.bar.id // null' "$shell_json")"; }
+  [[ -e $dest_plugin || -L $dest_plugin ]] && plugin_existed=true
+
+  step "Snapshot"
+  act "create $snap_dir" mkdir -p -m 700 "$snap_dir"
+  if [[ $pre_existed == true ]]; then
+    act "copy shell.json → $snap_dir/shell.json" cp --preserve=mode,timestamps -- "$shell_json" "$snap_dir/shell.json"
+  fi
+  if [[ $settings_existed == true ]]; then
+    act "copy ~/.config/omacale → $snap_dir/settings" cp -a -- "$settings_dir" "$snap_dir/settings"
+  fi
+  if [[ $plugin_existed == true ]]; then
+    warn "a plugin already exists at $dest_plugin — it will be set aside and restored on uninstall"
+    act "move existing plugin aside" mv -- "$dest_plugin" "$snap_dir/plugin"
+  fi
+  if (( ! dry_run )); then
+    jq -n \
+      --arg version "$VERSION" --arg at "$(date -Is)" --arg src "$src_plugin" \
+      --argjson existed "$pre_existed" --arg sha "$pre_sha" --argjson barId "$prev_bar" \
+      --argjson pluginExisted "$plugin_existed" --argjson dev "$( ((dev_link)) && echo true || echo false)" \
+      --argjson settingsExisted "$settings_existed" \
+      '{version:$version, installedAt:$at, source:$src, devLink:$dev,
+        pre:{shellJsonExisted:$existed, shellJsonSha:$sha, barId:$barId, pluginDirExisted:$pluginExisted, settingsDirExisted:$settingsExisted}}' \
+      | write_atomic "$state_file"
+  fi
+  (( dry_run )) || ok "state recorded"
+
+  trap '(( dry_run )) || rollback_install' ERR
+
+  icon_font_step
+
+  step "Install plugin"
+  act "mkdir -p $plugins_dir" mkdir -p "$plugins_dir"
+  if (( dev_link )); then
+    act "symlink $dest_plugin → $src_plugin" ln -s -- "$src_plugin" "$dest_plugin"
+  else
+    # Stage outside the watched plugins folder so the shell never hot-loads a
+    # half-copied tree, then move it into place in one rename.
+    local stage="$state_dir/stage.$$"
+    # The paths go in as "$1".. "$3", never pasted into the script: a ' in one would end the quoting.
+    act "copy plugin to $dest_plugin" bash -c 'rm -rf -- "$2" && copy_plugin "$1" "$2" && mv -T -- "$2" "$3"' \
+      copy "$src_plugin" "$stage" "$dest_plugin"
+  fi
+  (( dry_run )) || ok "plugin files in place"
+  shell_call shell rescanPlugins
+  if (( ! offline && ! dry_run )); then
+    wait_for plugin_listed 8 || fail "the shell did not discover $PLUGIN_ID"
+    ok "shell discovered $PLUGIN_ID"
+  fi
+
+  step "Optional: notification popups"
+  # Omarchy's notification daemon draws its own toasts. Omacale can only draw
+  # Caelestia-style ones if that daemon gives its toast window up, which is
+  # what scripts/notif-popups does (clone the plugin, patch the clone).
+  # Recorded so uninstall puts the stock daemon back -- and only if we were
+  # the ones who took it away.
+  local notif_clone=false
+  if (( offline || dry_run )); then
+    say "  ${d}skipped (notification popups are optional)${z}"
+  elif notif_script status 2>/dev/null | grep -q "^patched:   yes"; then
+    ok "notification popups already handed over to Omacale"
+    notif_clone=true
+  else
+    local want="$notif_choice"
+    if [[ -z $want ]]; then
+      if (( assume_yes )) || [[ ! -t 0 ]]; then want=yes
+      else
+        local reply
+        read -r -p "  Draw notification popups as Caelestia toasts? Omarchy's daemon keeps running; only its toast window moves to Omacale, and uninstall puts it back. [Y/n] " reply
+        [[ $reply =~ ^[nN] ]] && want=no || want=yes
+      fi
+    fi
+    if [[ $want == yes ]]; then
+      if notif_script install --no-restart; then
+        notif_clone=true; ok "Omacale draws the notification popups"
+      else
+        warn "could not hand the popups over; Omarchy keeps drawing its own toasts"
+      fi
+    else
+      say "  skipped — Omarchy keeps its own toasts (enable later with: $src_plugin/scripts/notif-popups install)"
+    fi
+  fi
+  if (( ! dry_run )); then
+    jq --argjson c "$notif_clone" '.installedNotifClone = $c' "$state_file" | write_atomic "$state_file"
+  fi
+
+  step "Optional: OSD"
+  # Omarchy keeps deciding when an OSD shows; the handover has Omacale draw
+  # it, volume and brightness as Caelestia's sliders and the rest as its
+  # toasts (scripts/osd-handover).
+  # Recorded so uninstall gives it back -- and only if we took it.
+  local osd_clone=false
+  if (( offline || dry_run )); then
+    say "  ${d}skipped (the OSD is optional)${z}"
+  elif osd_script status 2>/dev/null | grep -q "^patched:   yes"; then
+    ok "OSD already handed over to Omacale"
+    osd_clone=true
+  else
+    local want_osd="$osd_choice"
+    if [[ -z $want_osd ]]; then
+      if (( assume_yes )) || [[ ! -t 0 ]]; then want_osd=yes
+      else
+        local reply
+        read -r -p "  Draw Omarchy's OSD as Caelestia's: volume and brightness as sliders, everything else as toasts? Uninstall puts Omarchy's back. [Y/n] " reply
+        [[ $reply =~ ^[nN] ]] && want_osd=no || want_osd=yes
+      fi
+    fi
+    if [[ $want_osd == yes ]]; then
+      if osd_script install; then
+        osd_clone=true; clear_fell_back osd; ok "Omacale draws the OSD"
+      else
+        warn "could not hand the OSD over; Omarchy keeps drawing its own"
+      fi
+    else
+      say "  skipped — Omarchy keeps its own OSD (enable later in Settings › Panels › OSD)"
+    fi
+  fi
+  if (( ! dry_run )); then
+    jq --argjson c "$osd_clone" '.installedOsdClone = $c' "$state_file" | write_atomic "$state_file"
+  fi
+
+  step "Optional: lock screen"
+  # Omarchy's lock plugin keeps the session lock, PAM and the `lock` IPC;
+  # the handover swaps only the view it draws (scripts/lock-screen).
+  # Recorded so uninstall gives it back -- and only if we took it.
+  local lock_clone=false
+  if (( offline || dry_run )); then
+    say "  ${d}skipped (the lock screen is optional)${z}"
+  elif lock_handover_on; then
+    # Re-synced on every run, not left as it is: the wrapper in the clone is
+    # the *previous* Omacale's, and one that doesn't fit this Omarchy is a
+    # lock service that doesn't load at all. The shell restart below loads it.
+    if lock_script install >/dev/null; then
+      ok "lock screen handed over to Omacale (clone re-synced)"
+      lock_clone=true; set_lock_setting true
+    else
+      warn "the lock handover isn't verified for (or no longer fits) this Omarchy; giving the lock screen back to Omarchy"
+      lock_script remove >/dev/null || warn "could not give it back; run: $dest_plugin/scripts/lock-screen remove"
+    fi
+  else
+    local want_lock="$lock_choice"
+    if [[ -z $want_lock ]]; then
+      # Opt-in, unlike the other handovers: Omacale's lock view runs inside
+      # Omarchy's lock service and sees what is typed into the password field
+      # (it draws it). So --yes and a run with no terminal leave it off;
+      # --lock-screen turns it on.
+      if (( assume_yes )) || [[ ! -t 0 ]]; then want_lock=no
+      else
+        local reply
+        read -r -p "  Draw the lock screen as Caelestia's? Omarchy's lock plugin keeps the session lock and the password check, but Omacale's view runs inside it and draws the password field; uninstall puts Omarchy's back. [y/N] " reply
+        [[ $reply =~ ^[yY] ]] && want_lock=yes || want_lock=no
+      fi
+    fi
+    if [[ $want_lock == yes ]]; then
+      if lock_script install; then
+        lock_clone=true; set_lock_setting true; ok "Omacale draws the lock screen"
+      else
+        warn "could not hand the lock screen over; Omarchy keeps drawing its own"
+      fi
+    else
+      say "  skipped — Omarchy keeps its own lock screen (enable later in Settings › Panels › Lock screen)"
+    fi
+  fi
+  if (( ! dry_run )); then
+    jq --argjson c "$lock_clone" '.installedLockClone = $c' "$state_file" | write_atomic "$state_file"
+  fi
+
+  step "Optional: music visualiser"
+  local cava_installed_by_us=false
+  if command -v cava >/dev/null 2>&1; then
+    ok "cava already installed"
+  elif (( offline || dry_run )); then
+    say "  ${d}skipped (cava is optional)${z}"
+  else
+    local want="$cava_choice"
+    if [[ -z $want ]]; then
+      if (( assume_yes )) || [[ ! -t 0 ]]; then want=no
+      else
+        local reply; read -r -p "  Install cava for the audio bars around the cover art? It is removed again on uninstall. [y/N] " reply
+        [[ $reply =~ ^[yY] ]] && want=yes || want=no
+      fi
+    fi
+    if [[ $want == yes ]]; then
+      if omarchy pkg add cava && command -v cava >/dev/null 2>&1; then
+        cava_installed_by_us=true; ok "cava installed"
+      else
+        warn "could not install cava; the visualiser stays hidden"
+      fi
+    else
+      say "  skipped — the visualiser stays hidden (install later with: omarchy pkg add cava)"
+    fi
+  fi
+  if (( ! dry_run )); then
+    jq --argjson c "$cava_installed_by_us" '.installedCava = $c' "$state_file" | write_atomic "$state_file"
+  fi
+
+  step "Switch the bar"
+  if (( dry_run )); then
+    say "  ${d}[dry-run]${z} set bar.id = $PLUGIN_ID in $shell_json"
+  else
+    local base="{}"; [[ -f $shell_json ]] && base="$(cat "$shell_json")"
+    mkdir -p "$omarchy_cfg"
+    jq --arg id "$PLUGIN_ID" '. as $d | (if ($d.version // null) == null then .version = 1 else . end) | .bar = ((.bar // {}) | .id = $id)' <<<"$base" | write_atomic "$shell_json"
+    shell_call shell reloadConfig
+    ok "bar.id = $PLUGIN_ID"
+    if (( ! offline )); then
+      if command -v hyprctl >/dev/null 2>&1; then
+        wait_for bar_layer_present 10 || fail "the Omacale bar did not appear"
+        ok "Omacale bar is on screen"
+      else
+        warn "hyprctl not found; could not verify the bar is on screen"
+      fi
+      shell_running || fail "the Omarchy shell stopped responding after the switch"
+      if (( ! no_restart )); then
+        # The QML engine caches a plugin's types for the life of the process,
+        # so a reinstall/upgrade only shows new code after a restart.
+        say "  restarting the Omarchy shell to load fresh plugin code..."
+        omarchy restart shell >/dev/null 2>&1 || warn "shell restart failed; run: omarchy restart shell"
+        wait_for bar_layer_present 15 && ok "Omacale bar is on screen (fresh shell)" || warn "bar not visible after restart; run: omarchy restart shell"
+      elif [[ $font_installed_by_us == true ]]; then
+        warn "the icon font was just installed; icons appear after: omarchy restart shell"
+      fi
+    fi
+  fi
+  trap - ERR
+
+  step "Done"
+  say "  Open the launcher : omarchy-shell omacale launcher"
+  say "  Dashboard         : omarchy-shell omacale dashboard"
+  say "  Session menu      : omarchy-shell omacale session"
+  say "  Settings          : omarchy-shell omacale settings   (or right-click the logo)"
+  say "  Keybindings       : $script_dir/omacale binds"
+  say "  Undo everything   : ${b}omacale uninstall${z}"
+}
+
+# ------------------------------------------------------------------ upgrade
+
+# `install` over an existing install: new plugin files, the handovers the user
+# accepted rebuilt by this version, a fresh shell. The install record and its
+# snapshot are left alone, so uninstall still restores the setup from before
+# the *first* install; settings are the user's and are kept.
+cmd_upgrade() {
+  local from; from="$(jq -r '.version // "?"' "$state_file")"
+  step "Omacale $from → $VERSION — upgrade"
+
+  step "Plugin files"
+  if [[ -L $dest_plugin ]]; then
+    ok "symlinked to $(readlink -- "$dest_plugin") (--dev); nothing to copy"
+  elif (( dev_link )); then
+    # --dev over a copied install: swap the copy for a link to this checkout.
+    if [[ -d $dest_plugin && "$(jq -r '.id // empty' "$dest_plugin/manifest.json" 2>/dev/null)" != "$PLUGIN_ID" ]]; then
+      fail "$dest_plugin does not look like Omacale's plugin; not replacing it"
+    fi
+    act "replace copy with symlink $dest_plugin → $src_plugin" bash -c 'rm -rf -- "$1" && ln -s -- "$2" "$1"' \
+      link "$dest_plugin" "$src_plugin"
+    (( dry_run )) || ok "symlinked to $src_plugin (--dev)"
+  elif [[ -d $dest_plugin && "$(jq -r '.id // empty' "$dest_plugin/manifest.json" 2>/dev/null)" != "$PLUGIN_ID" ]]; then
+    fail "$dest_plugin does not look like Omacale's plugin; not overwriting it"
+  else
+    local stage="$state_dir/stage.$$"
+    # Staged outside the watched plugins folder and swapped in by rename, so
+    # the shell never loads a half-copied tree and a failed copy keeps the old.
+    local old="$state_dir/old.$$"
+    act "copy plugin to $dest_plugin" bash -c 'rm -rf -- "$2" "$4" && copy_plugin "$1" "$2" && { [[ ! -e $3 ]] || mv -T -- "$3" "$4"; } && mv -T -- "$2" "$3" && rm -rf -- "$4"' \
+      copy "$src_plugin" "$stage" "$dest_plugin" "$old"
+    (( dry_run )) || ok "plugin files updated"
+  fi
+  shell_call shell rescanPlugins
+
+  icon_font_step
+
+  # Rebuilt by this version's scripts (lock_script/notif_script read the copy
+  # just put in place). One the watchdog handed back is tried again: the
+  # fault may be what this version fixes, and the watchdog still guards it.
+  step "Handovers"
+  if (( offline || dry_run )); then
+    say "  ${d}skipped${z}"
+  else
+    if [[ "$(jq -r '.installedNotifClone // false' "$state_file")" == true ]]; then
+      if notif_script install --no-restart >/dev/null; then
+        clear_fell_back notifs; ok "notification popups: clone rebuilt"
+      else
+        warn "notification popups: the handover no longer fits this Omarchy; Omarchy keeps its own toasts"
+      fi
+    fi
+    if [[ "$(jq -r '.installedOsdClone // false' "$state_file")" == true ]]; then
+      if osd_script install >/dev/null; then
+        clear_fell_back osd; ok "OSD: clone rebuilt"
+      else
+        warn "OSD: the handover no longer fits this Omarchy; Omarchy keeps its own"
+      fi
+    fi
+    if [[ "$(jq -r '.installedLockClone // false' "$state_file")" == true ]]; then
+      if lock_script install >/dev/null; then
+        set_lock_setting true; ok "lock screen: clone rebuilt"
+      else
+        warn "lock screen: the handover no longer fits this Omarchy; giving it back to Omarchy"
+        lock_script remove >/dev/null || warn "could not give it back; run: $dest_plugin/scripts/lock-screen remove"
+        jq '.installedLockClone = false' "$state_file" | write_atomic "$state_file"
+      fi
+    fi
+  fi
+
+  # The bar may have been switched away since install (Settings, another bar
+  # plugin, a hand edit); an upgrade is a request for Omacale, so take it back.
+  local cur_bar="unset"; [[ -f $shell_json ]] && cur_bar="$(jq -r '.bar.id // "unset"' "$shell_json")"
+  if [[ $cur_bar != "$PLUGIN_ID" ]]; then
+    step "Switch the bar"
+    if (( dry_run )); then
+      say "  ${d}[dry-run]${z} set bar.id = $PLUGIN_ID in $shell_json (current: $cur_bar)"
+    else
+      json_ok "$shell_json" || fail "$shell_json is not valid JSON; refusing to touch it"
+      jq --arg id "$PLUGIN_ID" '.bar = ((.bar // {}) | .id = $id)' "$shell_json" | write_atomic "$shell_json"
+      ok "bar.id = $PLUGIN_ID (was: $cur_bar)"
+    fi
+  fi
+
+  local dev=false; [[ -L $dest_plugin ]] && dev=true
+  if (( ! dry_run )); then
+    jq --arg v "$VERSION" --argjson dev "$dev" '.version = $v | .devLink = $dev' "$state_file" | write_atomic "$state_file"
+  fi
+
+  step "Restart"
+  if (( offline || dry_run || no_restart )); then
+    say "  ${d}skipped; new code loads on the next: omarchy restart shell${z}"
+  else
+    # The QML engine caches plugin types for the life of the process, and a
+    # lock service that failed to load is only retried by a fresh shell.
+    omarchy restart shell >/dev/null 2>&1 || warn "shell restart failed; run: omarchy restart shell"
+    wait_for bar_layer_present 15 && ok "Omacale $VERSION is on screen" || warn "bar not visible after restart; run: omarchy restart shell"
+  fi
+  [[ $dev == true ]] && say "  ${d}(installed with --dev: the plugin follows this checkout)${z}"
+  step "Done"
+}
+
+# ---------------------------------------------------------------- uninstall
+
+cmd_uninstall() {
+  need jq
+  [[ ${EUID:-$(id -u)} -ne 0 ]] || fail "run as your normal user, not root"
+
+  if ! installed_state; then
+    if [[ -e $dest_plugin || -L $dest_plugin ]] && [[ "$(jq -r '.id // empty' "$dest_plugin/manifest.json" 2>/dev/null)" == "$PLUGIN_ID" ]]; then
+      warn "no install record, but Omacale's plugin directory exists (orphan)"
+      confirm "Remove the orphaned plugin and reset bar.id if it points at Omacale?"
+      if (( ! dry_run )); then
+        if [[ -f $shell_json && "$(jq -r '.bar.id // ""' "$shell_json")" == "$PLUGIN_ID" ]]; then
+          jq 'del(.bar.id)' "$shell_json" | write_atomic "$shell_json"; ok "bar.id reset to the built-in bar"
+        fi
+        shell_call shell reloadConfig
+        remove_menu_block
+        shell_toml remove || true
+        remove_plugin_dir; shell_call shell rescanPlugins
+      fi
+      say "Done."; return
+    fi
+    say "Omacale is not installed; nothing to do."; return
+  fi
+
+  step "Omacale — uninstall"
+  say "  bar.id     → $(jq -r 'if .pre.barId == null then "unset (built-in omarchy.bar)" else .pre.barId end' "$state_file")"
+  say "  shell.json → $(jq -r 'if .pre.shellJsonExisted then "restored from snapshot" else "removed if it only holds defaults" end' "$state_file")"
+  say "  plugin dir → removed$(jq -r 'if .pre.pluginDirExisted then " (your previous one is put back)" else "" end' "$state_file")"
+  { [[ "$(jq -r '.installedLockClone // false' "$state_file")" == true ]] || lock_handover_on; } && say "  lock       → given back to Omarchy"
+  [[ "$(jq -r '.installedOsdClone // false' "$state_file")" == true ]] && say "  osd        → given back to Omarchy"
+  [[ "$(jq -r '.installedCava // false' "$state_file")" == true ]] && say "  cava       → removed (Omacale installed it)"
+  [[ "$(jq -r '.installedFont // false' "$state_file")" == true ]] && say "  icon font  → $FONT_PKG removed (Omacale installed it)"
+  [[ "$(shell_toml status 2>/dev/null)" == present ]] && say "  shell.toml → Omacale's colour block removed (~/.config/omarchy/shell.toml)"
+  if (( keep_settings )); then say "  settings   → kept ($settings_dir)"
+  else say "  settings   → $(jq -r 'if .pre.settingsDirExisted then "restored to their pre-install copy" else "removed (~/.config/omacale)" end' "$state_file")"; fi
+  confirm "Continue?"
+
+  if (( dry_run )); then
+    say "  ${d}[dry-run]${z} nothing changed"; return
+  fi
+
+  if [[ "$(jq -r '.installedNotifClone // false' "$state_file")" == true ]] && (( ! offline )); then
+    step "Give the notification popups back"
+    # Before the restore below: `omarchy plugin remove` writes shell.json too,
+    # and the snapshot has to be the last word on that file.
+    if notif_script remove --no-restart; then ok "Omarchy draws its own toasts again"
+    else warn "could not remove the notification clone; run: $src_plugin/scripts/notif-popups remove"; fi
+  fi
+
+  if [[ "$(jq -r '.installedOsdClone // false' "$state_file")" == true ]] && (( ! offline )); then
+    step "Give the OSD back"
+    # Before the restore below, as the popups: `omarchy plugin remove` writes
+    # shell.json too.
+    if osd_script remove; then ok "Omarchy draws its own OSD again"
+    else warn "could not remove the OSD clone; run: $src_plugin/scripts/osd-handover remove"; fi
+  fi
+
+  # Recorded, or simply found drawing Omacale's view: either way the clone is
+  # running a view that is about to be removed, so it goes back to Omarchy's.
+  if (( ! offline )) && { [[ "$(jq -r '.installedLockClone // false' "$state_file")" == true ]] || lock_handover_on; }; then
+    step "Give the lock screen back"
+    # Same reason as the popups: `omarchy plugin remove` writes shell.json,
+    # so it has to happen before the snapshot is restored.
+    if lock_script remove; then ok "Omarchy draws its own lock screen again"
+    else warn "could not remove the lock clone; run: $dest_plugin/scripts/lock-screen remove"; fi
+  fi
+
+  step "Restore shell.json"
+  restore_shell_json || fail "could not restore shell.json; nothing was removed. Snapshot: $snap_dir/shell.json"
+  shell_call shell reloadConfig
+
+  if [[ "$(shell_toml status 2>/dev/null)" == present ]]; then
+    step "Give Omarchy's menus their theme colours back"
+    if shell_toml remove; then ok "Omacale's block removed from ~/.config/omarchy/shell.toml"
+    else warn "could not remove it; run: $src_plugin/scripts/shell-toml remove"; fi
+  fi
+
+  # Runtime-only Hyprland state (blur rule, "try this session" binds) must be
+  # read before the settings go away.
+  local had_runtime=0
+  if (( ! offline )) && command -v hyprctl >/dev/null 2>&1; then
+    [[ "$(jq -r '.appearance.transparency.enabled // false' "$settings_dir/settings.json" 2>/dev/null)" == true ]] && had_runtime=1
+    if hyprctl binds -j 2>/dev/null | jq -e 'any(.[]; (.description // "") | startswith("Omacale"))' >/dev/null \
+       && ! grep -qs 'omarchy-shell omacale' "$config_home/hypr/bindings.lua"; then had_runtime=1; fi
+  fi
+
+  step "Remove old Omarchy menu block"
+  remove_menu_block
+
+  step "Restore settings"
+  restore_settings
+
+  if [[ "$(jq -r '.installedCava // false' "$state_file")" == true ]] && (( ! offline )); then
+    step "Remove cava"
+    omarchy pkg drop cava && ok "cava removed (it was installed by Omacale)" || warn "could not remove cava; remove it with: omarchy pkg drop cava"
+  fi
+
+  if [[ "$(jq -r '.installedFont // false' "$state_file")" == true ]] && (( ! offline )); then
+    step "Remove icon font"
+    omarchy pkg drop "$FONT_PKG" && ok "$FONT_PKG removed (it was installed by Omacale)" || warn "could not remove $FONT_PKG; remove it with: omarchy pkg drop $FONT_PKG"
+  fi
+
+  step "Remove plugin"
+  if (( ! offline )); then
+    # Let the shell drop the bar first so no layer surface outlives its plugin.
+    wait_for '! bar_layer_present' 6 || warn "the Omacale layer is still mapped; continuing"
+  fi
+  remove_plugin_dir
+  restore_preexisting_plugin
+  shell_call shell rescanPlugins
+
+  if (( ! offline )); then
+    step "Verify"
+    if command -v hyprctl >/dev/null 2>&1; then
+      wait_for '! bar_layer_present' 8 && ok "no Omacale surfaces remain" || warn "an Omacale layer is still mapped — run: omarchy restart shell"
+    fi
+    if plugin_listed; then warn "the shell still lists $PLUGIN_ID — run: omarchy restart shell"; else ok "plugin is gone"; fi
+    if (( had_runtime )); then
+      # Reloading Hyprland re-reads your own config and drops runtime rules/binds.
+      hyprctl reload >/dev/null 2>&1 && ok "cleared Omacale's runtime Hyprland rules (hyprctl reload)"
+    fi
+    shell_running && ok "Omarchy shell is running" || warn "Omarchy shell is not responding — run: omarchy restart shell"
+  fi
+
+  if (( keep_state )); then
+    ok "state kept at $state_dir"
+  else
+    rm -rf -- "$state_dir"; ok "state removed"
+  fi
+  step "Done — your system is back to its pre-install state."
+}
+
+# A menu block left by an older Omacale (see scripts/switcher.sh).
+remove_menu_block() {
+  local helper="$dest_plugin/scripts/switcher.sh"
+  [[ -f $helper ]] || helper="$src_plugin/scripts/switcher.sh"
+  if bash "$helper" menu off; then ok "Background/Theme menu routes back to Omarchy's pickers"
+  else warn "could not clean $omarchy_cfg/extensions/omarchy-menu.jsonc; remove the 'omacale switcher' block by hand"; fi
+}
+
+restore_settings() {
+  local existed="false"
+  installed_state && existed="$(jq -r '.pre.settingsDirExisted // false' "$state_file")"
+  if (( keep_settings )); then
+    ok "settings kept at $settings_dir"; return
+  fi
+  if [[ -e $settings_dir || -L $settings_dir ]]; then
+    rm -rf -- "$settings_dir"
+  fi
+  if [[ $existed == true && -e $snap_dir/settings ]]; then
+    cp -a -- "$snap_dir/settings" "$settings_dir"
+    ok "settings restored to their pre-install copy"
+  else
+    ok "settings removed"
+  fi
+}
+
+# ----------------------------------------------------------------- binds
+
+binds_file() {
+  if [[ -f $dest_plugin/keybinds.lua ]]; then echo "$dest_plugin/keybinds.lua"; else echo "$src_plugin/keybinds.lua"; fi
+}
+
+cmd_binds() {
+  local f; f="$(binds_file)"
+  [[ -f $f ]] || fail "keybinds file not found: $f"
+  case "$bind_mode" in
+    print) cat -- "$f" ;;
+    copy)
+      need wl-copy
+      wl-copy < "$f"; ok "Omacale keybindings copied — paste them into ~/.config/hypr/bindings.lua" ;;
+    try)
+      need hyprctl
+      local lua; lua="$(grep -E '^o\.bind\(' "$f")"
+      [[ -n $lua ]] || fail "no bindings found in $f"
+      hyprctl eval "$lua" >/dev/null && ok "bound for this session (gone after 'hyprctl reload'):" && grep -oE '^o\.bind\("[^"]+", "[^"]+"' "$f" | sed -E 's/^o\.bind\("([^"]+)", "([^"]+)"/    \1  →  \2/' ;;
+    untry)
+      need hyprctl
+      local keys; keys="$(grep -oE '^o\.bind\("[^"]+"' "$f" | sed -E 's/^o\.bind\("([^"]+)"/hl.unbind("\1")/')"
+      hyprctl eval "$keys" >/dev/null && ok "session binds removed" ;;
+  esac
+}
+
+# --------------------------------------------------------------------- main
+
+while (( $# )); do
+  case "$1" in
+    install|uninstall|status|doctor|binds|settings|sidebar|utilities|toggles) cmd="$1" ;;
+    --copy) bind_mode=copy ;;
+    --try) bind_mode=try ;;
+    --untry) bind_mode=untry ;;
+    --keep-settings) keep_settings=1 ;;
+    --with-cava) cava_choice=yes ;;
+    --no-cava) cava_choice=no ;;
+    --notif-popups) notif_choice=yes ;;
+    --no-notif-popups) notif_choice=no ;;
+    --lock-screen) lock_choice=yes ;;
+    --no-lock-screen) lock_choice=no ;;
+    --osd) osd_choice=yes ;;
+    --no-osd) osd_choice=no ;;
+    --dry-run) dry_run=1 ;;
+    --yes|-y) assume_yes=1 ;;
+    --dev) dev_link=1 ;;
+    --keep-state) keep_state=1 ;;
+    --no-restart) no_restart=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) fail "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+case "$cmd" in
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  binds) cmd_binds ;;
+  settings) need omarchy-shell; omarchy-shell omacale settings >/dev/null || fail "Omacale is not running (is it installed?)" ;;
+  sidebar) need omarchy-shell; omarchy-shell omacale sidebar >/dev/null || fail "Omacale is not running (is it installed?)" ;;
+  utilities|toggles) need omarchy-shell; omarchy-shell omacale utilities >/dev/null || fail "Omacale is not running (is it installed?)" ;;
+  "") usage; exit 1 ;;
+esac

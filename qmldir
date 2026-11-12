@@ -1,0 +1,207 @@
+AboutCard 1.0 modules/settings/cards/AboutCard.qml
+ActiveIndicator 1.0 modules/bar/workspaces/ActiveIndicator.qml
+Anim 1.0 components/Anim.qml
+Bar 1.0 Bar.qml
+ButtonRow 1.0 components/controls/ButtonRow.qml
+BarContent 1.0 modules/bar/BarContent.qml
+BarWidgetSlot 1.0 modules/bar/BarWidgetSlot.qml
+PluginBarFacade 1.0 modules/bar/PluginBarFacade.qml
+CAnim 1.0 components/CAnim.qml
+CircularProgress 1.0 components/controls/CircularProgress.qml
+ColouredIcon 1.0 components/ColouredIcon.qml
+singleton AppService 1.0 services/AppService.qml
+singleton Colours 1.0 core/Colours.qml
+singleton Config 1.0 core/Config.qml
+singleton Liquid 1.0 core/Liquid.qml
+singleton Glass 1.0 core/Glass.qml
+BlobDeform 1.0 components/shapes/BlobDeform.qml
+LiquidDetach 1.0 components/shapes/LiquidDetach.qml
+LiquidDrawer 1.0 components/shapes/LiquidDrawer.qml
+Spring 1.0 components/Spring.qml
+BlobPopup 1.0 components/controls/BlobPopup.qml
+BlobSurface 1.0 components/shapes/BlobSurface.qml
+ConnectedRect 1.0 components/shapes/ConnectedRect.qml
+CoverArt 1.0 components/CoverArt.qml
+Dashboard 1.0 modules/dashboard/Dashboard.qml
+singleton GameMode 1.0 services/GameMode.qml
+IconButton 1.0 components/controls/IconButton.qml
+IdleInhibitCard 1.0 modules/utilities/IdleInhibitCard.qml
+singleton HyprLook 1.0 services/HyprLook.qml
+singleton GlassBlur 1.0 services/GlassBlur.qml
+singleton IdleService 1.0 services/IdleService.qml
+singleton UpdateService 1.0 services/UpdateService.qml
+singleton KbService 1.0 services/KbService.qml
+KeybindsCard 1.0 modules/settings/cards/KeybindsCard.qml
+Launcher 1.0 modules/launcher/Launcher.qml
+singleton MenuService 1.0 services/MenuService.qml
+LookNFeelCard 1.0 modules/settings/cards/LookNFeelCard.qml
+MIcon 1.0 components/MIcon.qml
+MProgress 1.0 components/MProgress.qml
+MShape 1.0 components/shapes/MShape.qml
+MSlider 1.0 components/controls/MSlider.qml
+MSwitch 1.0 components/controls/MSwitch.qml
+MText 1.0 components/MText.qml
+MediaTab 1.0 modules/dashboard/MediaTab.qml
+NotifGroup 1.0 modules/sidebar/NotifGroup.qml
+NotifItem 1.0 modules/sidebar/NotifItem.qml
+NotifPopups 1.0 modules/notifications/NotifPopups.qml
+singleton NotifService 1.0 services/NotifService.qml
+NotifToast 1.0 modules/notifications/NotifToast.qml
+PerfTab 1.0 modules/dashboard/PerfTab.qml
+Pill 1.0 components/Pill.qml
+PopoutContent 1.0 modules/bar/PopoutContent.qml
+QuickToggles 1.0 modules/utilities/QuickToggles.qml
+RecordCard 1.0 modules/utilities/RecordCard.qml
+RecordingList 1.0 modules/utilities/RecordingList.qml
+singleton RecordService 1.0 services/RecordService.qml
+PopupRow 1.0 modules/settings/common/PopupRow.qml
+RowLabel 1.0 modules/settings/common/RowLabel.qml
+RowNav 1.0 modules/settings/rows/RowNav.qml
+RowSelect 1.0 modules/settings/rows/RowSelect.qml
+RowSlider 1.0 modules/settings/rows/RowSlider.qml
+RowStepper 1.0 modules/settings/rows/RowStepper.qml
+RowText 1.0 modules/settings/rows/RowText.qml
+RowToggle 1.0 modules/settings/rows/RowToggle.qml
+ScreenScope 1.0 modules/drawers/ScreenScope.qml
+GlassBackdrop 1.0 modules/drawers/GlassBackdrop.qml
+SectionHeader 1.0 components/SectionHeader.qml
+SeedPicker 1.0 modules/settings/cards/SeedPicker.qml
+Session 1.0 modules/session/Session.qml
+Settings 1.0 modules/settings/Settings.qml
+SettingsPage 1.0 modules/settings/SettingsPage.qml
+ShaderMaskEffect 1.0 components/effects/ShaderMaskEffect.qml
+Sidebar 1.0 modules/sidebar/Sidebar.qml
+Sparkline 1.0 components/shapes/Sparkline.qml
+SplitSelect 1.0 components/controls/SplitSelect.qml
+SpecialWorkspaces 1.0 modules/bar/workspaces/SpecialWorkspaces.qml
+StateLayer 1.0 components/StateLayer.qml
+KeyNav 1.0 components/KeyNav.qml
+FocusRing 1.0 components/FocusRing.qml
+NavCursor 1.0 components/NavCursor.qml
+StylePreview 1.0 modules/settings/cards/StylePreview.qml
+singleton Sys 1.0 services/Sys.qml
+singleton IconFiles 1.0 services/IconFiles.qml
+singleton Tk 1.0 core/Tk.qml
+Toggle 1.0 components/controls/Toggle.qml
+Utilities 1.0 modules/utilities/Utilities.qml
+WavyLine 1.0 components/shapes/WavyLine.qml
+WeatherTab 1.0 modules/dashboard/WeatherTab.qml
+Workspaces 1.0 modules/bar/workspaces/Workspaces.qml
+BigButton 1.0 components/controls/BigButton.qml
+BluetoothPage 1.0 modules/settings/pages/BluetoothPage.qml
+BtDevice 1.0 modules/settings/pages/BtDevice.qml
+BtDeviceRow 1.0 modules/settings/pages/BtDeviceRow.qml
+BtPairing 1.0 modules/settings/pages/BtPairing.qml
+singleton BtService 1.0 services/BtService.qml
+InfoRow 1.0 modules/settings/common/InfoRow.qml
+ItemList 1.0 modules/settings/common/ItemList.qml
+LoadingIndicator 1.0 components/LoadingIndicator.qml
+MorphIndicator 1.0 components/MorphIndicator.qml
+NetworkDetail 1.0 modules/settings/pages/NetworkDetail.qml
+NetworkPage 1.0 modules/settings/pages/NetworkPage.qml
+singleton NetService 1.0 services/NetService.qml
+RowButton 1.0 modules/settings/common/RowButton.qml
+LogoIcon 1.0 components/LogoIcon.qml
+LogoPicker 1.0 modules/settings/cards/LogoPicker.qml
+WallpaperItem 1.0 modules/launcher/WallpaperItem.qml
+WallpaperList 1.0 modules/launcher/WallpaperList.qml
+singleton Wallpapers 1.0 services/Wallpapers.qml
+WallLuminance 1.0 core/WallLuminance.qml
+AppVolumes 1.0 modules/settings/pages/AppVolumes.qml
+AudioDeviceList 1.0 modules/settings/pages/AudioDeviceList.qml
+AudioPage 1.0 modules/settings/pages/AudioPage.qml
+singleton AudioService 1.0 services/AudioService.qml
+AudioSlider 1.0 modules/settings/pages/AudioSlider.qml
+AllApps 1.0 modules/settings/pages/AllApps.qml
+AppInfo 1.0 modules/settings/pages/AppInfo.qml
+AppsPage 1.0 modules/settings/pages/AppsPage.qml
+IconTextButton 1.0 components/controls/IconTextButton.qml
+WallpaperGrid 1.0 modules/settings/pages/WallpaperGrid.qml
+FadeFlickable 1.0 components/containers/FadeFlickable.qml
+MFlickable 1.0 components/containers/MFlickable.qml
+MListView 1.0 components/containers/MListView.qml
+MTextField 1.0 components/controls/MTextField.qml
+Elevation 1.0 components/effects/Elevation.qml
+OutlinedField 1.0 components/controls/OutlinedField.qml
+MScrollBar 1.0 components/controls/MScrollBar.qml
+LockUi 1.0 modules/lock/LockUi.qml
+LockPanel 1.0 modules/lock/LockPanel.qml
+LockUnlockFx 1.0 modules/lock/LockUnlockFx.qml
+LockContent 1.0 modules/lock/LockContent.qml
+LockCenter 1.0 modules/lock/LockCenter.qml
+LockPassword 1.0 modules/lock/LockPassword.qml
+LockMessage 1.0 modules/lock/LockMessage.qml
+LockWeather 1.0 modules/lock/LockWeather.qml
+LockFetch 1.0 modules/lock/LockFetch.qml
+LockMedia 1.0 modules/lock/LockMedia.qml
+LockResources 1.0 modules/lock/LockResources.qml
+LockNotifs 1.0 modules/lock/LockNotifs.qml
+LockCard 1.0 modules/settings/cards/LockCard.qml
+NotifCard 1.0 modules/settings/cards/NotifCard.qml
+OsdCard 1.0 modules/settings/cards/OsdCard.qml
+singleton LockService 1.0 services/LockService.qml
+singleton LockFx 1.0 services/LockFx.qml
+singleton NotifHandover 1.0 services/NotifHandover.qml
+Handover 1.0 services/Handover.qml
+Overview 1.0 modules/overview/Overview.qml
+OverviewWindow 1.0 modules/overview/OverviewWindow.qml
+WindowInfo 1.0 modules/windowinfo/WindowInfo.qml
+WinfoPreview 1.0 modules/windowinfo/WinfoPreview.qml
+WinfoDetails 1.0 modules/windowinfo/WinfoDetails.qml
+WinfoButtons 1.0 modules/windowinfo/WinfoButtons.qml
+singleton PluginService 1.0 services/PluginService.qml
+PluginsPage 1.0 modules/settings/pages/PluginsPage.qml
+PluginInfo 1.0 modules/settings/pages/PluginInfo.qml
+singleton WindowIcons 1.0 services/WindowIcons.qml
+FadeListView 1.0 components/containers/FadeListView.qml
+TrayIcons 1.0 modules/settings/pages/TrayIcons.qml
+Background 1.0 modules/background/Background.qml
+DesktopClock 1.0 modules/background/DesktopClock.qml
+Visualiser 1.0 modules/background/Visualiser.qml
+VisualiserBars 1.0 modules/background/VisualiserBars.qml
+ClipboardItem 1.0 modules/launcher/ClipboardItem.qml
+ClipboardPreview 1.0 modules/launcher/ClipboardPreview.qml
+singleton ClipboardService 1.0 services/ClipboardService.qml
+FilledSlider 1.0 components/controls/FilledSlider.qml
+Osd 1.0 modules/osd/Osd.qml
+Toasts 1.0 modules/utilities/Toasts.qml
+ToastItem 1.0 modules/utilities/ToastItem.qml
+singleton Toaster 1.0 services/Toaster.qml
+singleton OsdService 1.0 services/OsdService.qml
+singleton OsdHandover 1.0 services/OsdHandover.qml
+FileDialog 1.0 components/filedialog/FileDialog.qml
+FileDialogButtons 1.0 components/filedialog/FileDialogButtons.qml
+FileDialogCurrent 1.0 components/filedialog/FileDialogCurrent.qml
+FileDialogHeader 1.0 components/filedialog/FileDialogHeader.qml
+FileDialogSidebar 1.0 components/filedialog/FileDialogSidebar.qml
+FolderContents 1.0 components/filedialog/FolderContents.qml
+LogoEntry 1.0 modules/bar/entries/LogoEntry.qml
+OverflowEntry 1.0 modules/bar/entries/OverflowEntry.qml
+PowerEntry 1.0 modules/bar/entries/PowerEntry.qml
+ClockEntry 1.0 modules/bar/entries/ClockEntry.qml
+WorkspacesEntry 1.0 modules/bar/entries/WorkspacesEntry.qml
+ActiveWindowEntry 1.0 modules/bar/entries/ActiveWindowEntry.qml
+TrayEntry 1.0 modules/bar/entries/TrayEntry.qml
+StatusRun 1.0 modules/bar/entries/StatusRun.qml
+PluginsEntry 1.0 modules/bar/entries/PluginsEntry.qml
+SinglePluginEntry 1.0 modules/bar/entries/SinglePluginEntry.qml
+SessionPicture 1.0 modules/settings/cards/SessionPicture.qml
+SessionButtons 1.0 modules/settings/cards/SessionButtons.qml
+LayoutPage 1.0 modules/settings/pages/LayoutPage.qml
+singleton OmarchySurfaces 1.0 services/OmarchySurfaces.qml
+ScreensCard 1.0 modules/settings/pages/ScreensCard.qml
+ScreenSelect 1.0 modules/settings/rows/ScreenSelect.qml
+singleton DisplayService 1.0 services/DisplayService.qml
+singleton NightLight 1.0 services/NightLight.qml
+DisplayIdentify 1.0 modules/display/DisplayIdentify.qml
+DisplayConfirm 1.0 modules/display/DisplayConfirm.qml
+DisplayQuick 1.0 modules/display/DisplayQuick.qml
+DisplayPage 1.0 modules/settings/pages/DisplayPage.qml
+DisplayEditor 1.0 modules/settings/pages/DisplayEditor.qml
+DisplayProfiles 1.0 modules/settings/pages/DisplayProfiles.qml
+DisplayWorkspaces 1.0 modules/settings/pages/DisplayWorkspaces.qml
+DisplayNight 1.0 modules/settings/pages/DisplayNight.qml
+MirrorCard 1.0 modules/settings/pages/MirrorCard.qml
+DisplayTextSize 1.0 modules/settings/pages/DisplayTextSize.qml
+DisplayBrightnessList 1.0 modules/settings/pages/DisplayBrightnessList.qml
+DisplaysCard 1.0 modules/utilities/DisplaysCard.qml

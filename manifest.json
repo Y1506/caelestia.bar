@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "y1506.bar",
+  "name": "Celestia",
+  "version": "1.0.0",
+  "author": "y1506",
+  "license": "GPL-3.0-only",
+  "description": "A Caelestia-style shell for Omarchy: screen frame, slim vertical bar, and slide-out drawers.",
+  "kinds": ["bar"],
+  "entryPoints": {
+    "bar": "Bar.qml"
+  }
+}
